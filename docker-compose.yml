@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tg_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-tg_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tg_bot_password}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tg_bot} -d ${POSTGRES_DB:-tg_bot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      TG_API_ID: ${TG_API_ID}
+      TG_API_HASH: ${TG_API_HASH}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tg_bot}:${POSTGRES_PASSWORD:-tg_bot_password}@db:5432/${POSTGRES_DB:-tg_bot}
+      BOT_DATA_DIR: /app/data
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      DEFAULT_LIMIT: ${DEFAULT_LIMIT:-50}
+      QR_TIMEOUT_SECONDS: ${QR_TIMEOUT_SECONDS:-180}
+    volumes:
+      - bot_data:/app/data
+
+volumes:
+  pg_data:
+  bot_data:
