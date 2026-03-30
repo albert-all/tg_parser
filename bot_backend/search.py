@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import csv
@@ -8,12 +8,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from telethon import TelegramClient
+from telethon import TelegramClient, functions, types
 from telethon.errors import FloodWaitError
 
 from bot_backend.db import ThemeDTO
 
-WORD_RE = re.compile(r"[a-zа-я0-9]+")
+WORD_RE = re.compile(r"[a-zР°-СЏ0-9]+")
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -26,6 +26,7 @@ class SearchParams:
     limit: Optional[int]
     date_from: Optional[datetime]
     date_to: Optional[datetime]
+    deep_comments: bool = False
 
 
 @dataclass
@@ -36,6 +37,15 @@ class SearchItem:
     matched_keywords: list[str]
     text: str
     link: str
+
+
+@dataclass
+class SearchTarget:
+    chat_ref: str
+    entity: object
+    display_chat: str
+    mode: str
+    source_channel_id: Optional[int] = None
 
 
 def ensure_utc(dt: datetime) -> datetime:
@@ -65,7 +75,7 @@ def parse_date_to(value: str) -> datetime:
 
 def validate_date_range(date_from: Optional[datetime], date_to: Optional[datetime]) -> None:
     if date_from and date_to and date_from > date_to:
-        raise SearchError("Некорректный диапазон: date-from позже date-to.")
+        raise SearchError("РќРµРєРѕСЂСЂРµРєС‚РЅС‹Р№ РґРёР°РїР°Р·РѕРЅ: date-from РїРѕР·Р¶Рµ date-to.")
 
 
 def in_date_range(msg_date: datetime, date_from: Optional[datetime], date_to: Optional[datetime]) -> bool:
@@ -88,7 +98,7 @@ def iter_offset_date(date_to: Optional[datetime]) -> Optional[datetime]:
 
 
 def normalize_text(value: str) -> str:
-    return (value or "").lower().replace("ё", "е")
+    return (value or "").lower().replace("С‘", "Рµ")
 
 
 def normalize_theme_for_filename(theme: str) -> str:
@@ -154,7 +164,7 @@ def detect_matched_keywords(text: str, prepared_keywords: list[tuple[str, str, l
 
 
 def extract_text(msg) -> str:
-    return (msg.message or "").strip()
+    return (getattr(msg, "raw_text", None) or getattr(msg, "message", None) or "").strip()
 
 
 def entity_display_name(entity, fallback: str) -> str:
@@ -236,7 +246,7 @@ class SearchService:
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                raise SearchError("Аккаунт не авторизован. Сначала выполните /auth.")
+                raise SearchError("РђРєРєР°СѓРЅС‚ РЅРµ Р°РІС‚РѕСЂРёР·РѕРІР°РЅ. РЎРЅР°С‡Р°Р»Р° РІС‹РїРѕР»РЅРёС‚Рµ /auth.")
 
             refs: list[str] = []
             seen: set[str] = set()
@@ -277,26 +287,29 @@ class SearchService:
     ) -> tuple[list[SearchItem], Path]:
         validate_date_range(params.date_from, params.date_to)
         if params.limit is not None and params.limit <= 0:
-            raise SearchError("Лимит должен быть > 0, либо None для поиска без лимита.")
+            raise SearchError("Р›РёРјРёС‚ РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ > 0, Р»РёР±Рѕ None РґР»СЏ РїРѕРёСЃРєР° Р±РµР· Р»РёРјРёС‚Р°.")
         if not theme.chats:
-            raise SearchError("В теме нет чатов.")
+            raise SearchError("Р’ С‚РµРјРµ РЅРµС‚ С‡Р°С‚РѕРІ.")
         if not theme.keywords:
-            raise SearchError("В теме нет ключевых слов.")
+            raise SearchError("Р’ С‚РµРјРµ РЅРµС‚ РєР»СЋС‡РµРІС‹С… СЃР»РѕРІ.")
 
         prepared_keywords = prepare_keywords(theme.keywords)
         if not prepared_keywords:
-            raise SearchError("Список ключевых слов пуст после нормализации.")
+            raise SearchError("РЎРїРёСЃРѕРє РєР»СЋС‡РµРІС‹С… СЃР»РѕРІ РїСѓСЃС‚ РїРѕСЃР»Рµ РЅРѕСЂРјР°Р»РёР·Р°С†РёРё.")
         search_keywords = [kw for kw, _, _ in prepared_keywords]
 
         client = self._new_client(user_id)
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                raise SearchError("Аккаунт не авторизован. Сначала выполните /auth.")
+                raise SearchError("РђРєРєР°СѓРЅС‚ РЅРµ Р°РІС‚РѕСЂРёР·РѕРІР°РЅ. РЎРЅР°С‡Р°Р»Р° РІС‹РїРѕР»РЅРёС‚Рµ /auth.")
 
             entities = await self._resolve_entities(client, theme.chats)
             if not entities:
-                raise SearchError("Не удалось получить ни один чат из темы.")
+                raise SearchError("РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ РЅРё РѕРґРёРЅ С‡Р°С‚ РёР· С‚РµРјС‹.")
+            targets = await self._build_search_targets(client, entities)
+            if not targets:
+                raise SearchError("РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕРґРіРѕС‚РѕРІРёС‚СЊ РЅРё РѕРґРёРЅ РёСЃС‚РѕС‡РЅРёРє СЃРѕРѕР±С‰РµРЅРёР№ РґР»СЏ РїРѕРёСЃРєР°.")
 
             collected: dict[tuple[int, int], dict] = {}
             match_cache: dict[tuple[int, int], list[str]] = {}
@@ -304,10 +317,18 @@ class SearchService:
             offset_date = iter_offset_date(params.date_to)
 
             scanned = 0
-            for chat_ref, entity in entities.items():
-                for kw in search_keywords:
-                    per_keyword_found = 0
-                    async for msg in self._iter_messages_with_retry(client, entity, kw, search_limit, offset_date):
+            for target in targets:
+                entity = target.entity
+                if target.mode == "comments" and self._should_use_local_comment_scan(params):
+                    comment_result_limit = self._comment_result_budget(params.limit, deep=params.deep_comments)
+                    unique_comment_hits = 0
+                    scanned_comments = 0
+                    async for msg in self._iter_messages_with_retry(client, entity, None, None, offset_date):
+                        if not self._is_discussion_comment_message(msg, target.source_channel_id):
+                            continue
+                        scanned_comments += 1
+                        if progress_cb and scanned_comments % 500 == 0:
+                            await progress_cb(f"РџСЂРѕСЃРјРѕС‚СЂРµРЅРѕ РєРѕРјРјРµРЅС‚Р°СЂРёРµРІ: {scanned_comments}")
                         if should_stop_by_lower_bound(msg.date, params.date_from):
                             break
                         if not in_date_range(msg.date, params.date_from, params.date_to):
@@ -324,8 +345,45 @@ class SearchService:
                         if key not in collected:
                             collected[key] = {
                                 "date": msg.date,
-                                "entity": entity,
-                                "chat_ref": chat_ref,
+                                "target": target,
+                                "msg": msg,
+                                "matched_keywords": set(),
+                            }
+                            unique_comment_hits += 1
+                        collected[key]["matched_keywords"].update(local_matches)
+
+                        scanned += 1
+                        if progress_cb and scanned % 20 == 0:
+                            await progress_cb(f"Обработано совпадений: {scanned}")
+                        if comment_result_limit is not None and unique_comment_hits >= comment_result_limit:
+                            break
+                    continue
+
+                target_search_limit = search_limit
+                if target.mode == "comments" and search_limit is not None:
+                    target_search_limit = self._comment_result_budget(search_limit, deep=params.deep_comments)
+                for kw in search_keywords:
+                    per_keyword_found = 0
+                    async for msg in self._iter_messages_with_retry(client, entity, kw, target_search_limit, offset_date):
+                        if target.mode == "comments" and not self._is_discussion_comment_message(msg, target.source_channel_id):
+                            continue
+                        if should_stop_by_lower_bound(msg.date, params.date_from):
+                            break
+                        if not in_date_range(msg.date, params.date_from, params.date_to):
+                            continue
+
+                        key = (entity.id, msg.id)
+                        local_matches = match_cache.get(key)
+                        if local_matches is None:
+                            local_matches = detect_matched_keywords(extract_text(msg), prepared_keywords)
+                            match_cache[key] = local_matches
+                        if not local_matches:
+                            continue
+
+                        if key not in collected:
+                            collected[key] = {
+                                "date": msg.date,
+                                "target": target,
                                 "msg": msg,
                                 "matched_keywords": set(),
                             }
@@ -345,13 +403,13 @@ class SearchService:
 
             items: list[SearchItem] = []
             for item in raw_items:
-                entity = item["entity"]
+                target = item["target"]
+                entity = target.entity
                 msg = item["msg"]
-                chat_ref = item["chat_ref"]
                 items.append(
                     SearchItem(
                         date=msg.date,
-                        chat=entity_display_name(entity, chat_ref),
+                        chat=target.display_chat,
                         msg_id=msg.id,
                         matched_keywords=sorted(item["matched_keywords"]),
                         text=extract_text(msg),
@@ -381,6 +439,93 @@ class SearchService:
             except Exception:
                 continue
         return entities
+
+    async def _build_search_targets(self, client: TelegramClient, entities: dict[str, object]) -> list[SearchTarget]:
+        targets: list[SearchTarget] = []
+        seen_target_keys: set[tuple[int, str, int]] = set()
+        base_entity_ids: set[int] = set()
+
+        for chat_ref, entity in entities.items():
+            entity_id = getattr(entity, "id", None)
+            if not isinstance(entity_id, int):
+                continue
+            base_entity_ids.add(entity_id)
+            target_key = (entity_id, "main", 0)
+            if target_key in seen_target_keys:
+                continue
+            seen_target_keys.add(target_key)
+            targets.append(
+                SearchTarget(
+                    chat_ref=chat_ref,
+                    entity=entity,
+                    display_chat=entity_display_name(entity, chat_ref),
+                    mode="main",
+                )
+            )
+
+        for chat_ref, entity in entities.items():
+            if not self._can_have_linked_discussion(entity):
+                continue
+            discussion_entity = await self._get_linked_discussion_entity(client, entity)
+            if discussion_entity is None:
+                continue
+
+            discussion_id = getattr(discussion_entity, "id", None)
+            source_channel_id = getattr(entity, "id", None)
+            if not isinstance(discussion_id, int) or not isinstance(source_channel_id, int):
+                continue
+            if discussion_id in base_entity_ids:
+                continue
+
+            target_key = (discussion_id, "comments", source_channel_id)
+            if target_key in seen_target_keys:
+                continue
+            seen_target_keys.add(target_key)
+            targets.append(
+                SearchTarget(
+                    chat_ref=chat_ref,
+                    entity=discussion_entity,
+                    display_chat=f"{entity_display_name(entity, chat_ref)} / РєРѕРјРјРµРЅС‚Р°СЂРёРё",
+                    mode="comments",
+                    source_channel_id=source_channel_id,
+                )
+            )
+
+        return targets
+
+    @staticmethod
+    def _can_have_linked_discussion(entity) -> bool:
+        return bool(getattr(entity, "broadcast", False))
+
+    @staticmethod
+    def _is_discussion_comment_message(msg, source_channel_id: Optional[int]) -> bool:
+        reply_to = getattr(msg, "reply_to", None)
+        if reply_to is None:
+            return False
+
+        peer = getattr(reply_to, "reply_to_peer_id", None)
+        peer_channel_id = getattr(peer, "channel_id", None)
+        if source_channel_id is not None and peer_channel_id == source_channel_id:
+            return True
+
+        top_id = getattr(reply_to, "reply_to_top_id", None)
+        msg_id = getattr(msg, "id", None)
+        if isinstance(top_id, int) and isinstance(msg_id, int) and top_id != msg_id:
+            return True
+
+        return False
+
+    @staticmethod
+    def _should_use_local_comment_scan(params: SearchParams) -> bool:
+        return params.deep_comments or params.limit is not None or params.date_from is not None
+
+    @staticmethod
+    def _comment_result_budget(limit: Optional[int], *, deep: bool = False) -> Optional[int]:
+        if limit is None:
+            return None
+        if deep:
+            return max(limit * 10, limit + 200)
+        return max(limit * 3, limit + 20)
 
     @staticmethod
     def _normalize_chat_ref(chat_ref: str) -> str:
@@ -459,6 +604,24 @@ class SearchService:
             except FloodWaitError as e:
                 await asyncio.sleep(max(1, int(e.seconds)) + 1)
 
+    async def _get_linked_discussion_entity(self, client: TelegramClient, entity):
+        while True:
+            try:
+                full = await client(functions.channels.GetFullChannelRequest(channel=entity))
+                linked_chat_id = getattr(full.full_chat, "linked_chat_id", None)
+                if not isinstance(linked_chat_id, int):
+                    return None
+
+                for item in getattr(full, "chats", []) or []:
+                    if getattr(item, "id", None) == linked_chat_id:
+                        return item
+
+                return await client.get_entity(types.PeerChannel(linked_chat_id))
+            except FloodWaitError as e:
+                await asyncio.sleep(max(1, int(e.seconds)) + 1)
+            except Exception:
+                return None
+
     async def _resolve_chat_direct(self, client: TelegramClient, chat_ref: str):
         if chat_ref.startswith("@"):
             return await client.get_entity(chat_ref)
@@ -479,13 +642,19 @@ class SearchService:
         self,
         client: TelegramClient,
         entity,
-        query: str,
+        query: Optional[str],
         limit: Optional[int],
         offset_date: Optional[datetime],
     ):
         while True:
             try:
-                async for msg in client.iter_messages(entity, search=query, limit=limit, offset_date=offset_date):
+                kwargs = {
+                    "limit": limit,
+                    "offset_date": offset_date,
+                }
+                if query:
+                    kwargs["search"] = query
+                async for msg in client.iter_messages(entity, **kwargs):
                     yield msg
                 return
             except FloodWaitError as e:
@@ -533,3 +702,4 @@ class SearchService:
                     }
                 )
         return target
+

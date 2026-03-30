@@ -129,7 +129,7 @@ QR_TIMEOUT_SECONDS=180
 
 ### Шаг 3: Проверка файловой структуры
 ```bash
-ls -la /opt/tg_parser/
+  ls -la /opt/tg_parser/
 # Должны быть: docker-compose.yml, Dockerfile.bot, requirements_bot.txt, tg_bot.py, .env
 ```
 

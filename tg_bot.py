@@ -22,9 +22,8 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 from bot_backend.auth import AuthManager
@@ -87,6 +86,13 @@ SEARCH_FORMAT_LABELS = {
     "csv": "Только CSV",
 }
 
+SEARCH_COMMENTS_MODE_LABELS = {
+    "std": "Стандартный",
+    "deep": "Глубокий",
+}
+
+SILENT_UI_TEXT = "\u2060"
+
 
 @dataclass
 class ParsedSearchCommand:
@@ -95,6 +101,7 @@ class ParsedSearchCommand:
     date_to: Optional[datetime]
     limit: Optional[int]
     output_format: str
+    deep_comments: bool
 
 
 def _main_menu(*, show_auth_actions: bool = True) -> InlineKeyboardMarkup:
@@ -128,29 +135,6 @@ async def _main_menu_for_user(user_id: int) -> InlineKeyboardMarkup:
     is_auth = await auth.is_authorized(user_id)
     return _main_menu(show_auth_actions=not is_auth)
 
-
-def _nav_reply_keyboard(*, show_auth_actions: bool) -> ReplyKeyboardMarkup:
-    rows: list[list[KeyboardButton]] = [
-        [KeyboardButton(text="Главное меню"), KeyboardButton(text="Помощь")],
-        [KeyboardButton(text="Темы"), KeyboardButton(text="Поиск"), KeyboardButton(text="Подписки")],
-        [KeyboardButton(text="Отменить поиск")],
-    ]
-    if show_auth_actions:
-        rows.append(
-            [
-                KeyboardButton(text="Авторизация"),
-                KeyboardButton(text="Проверить QR"),
-                KeyboardButton(text="Обновить QR"),
-            ]
-        )
-    return ReplyKeyboardMarkup(
-        keyboard=rows,
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Выберите раздел",
-    )
-
-
 async def _ensure_nav_keyboard(
     message: Message,
     user_id: int,
@@ -158,16 +142,14 @@ async def _ensure_nav_keyboard(
     show_auth_actions: Optional[bool] = None,
     force: bool = False,
 ) -> None:
-    if show_auth_actions is None:
-        cached = nav_keyboard_mode_by_user.get(user_id)
-        if cached is not None and not force:
-            return
-        _, _, auth, _ = _require_services()
-        show_auth_actions = not await auth.is_authorized(user_id)
-    if not force and nav_keyboard_mode_by_user.get(user_id) == show_auth_actions:
+    del show_auth_actions
+    if not force and nav_keyboard_mode_by_user.get(user_id):
         return
-    nav_keyboard_mode_by_user[user_id] = show_auth_actions
-    await message.answer("Быстрая навигация закреплена ниже.", reply_markup=_nav_reply_keyboard(show_auth_actions=show_auth_actions))
+    nav_keyboard_mode_by_user[user_id] = True
+    await message.answer(
+        SILENT_UI_TEXT,
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 def _auth_actions_menu() -> InlineKeyboardMarkup:
@@ -186,10 +168,10 @@ def _auth_actions_menu() -> InlineKeyboardMarkup:
 def _themes_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="1) Создать и добавить", callback_data="themes:section:add")],
-            [InlineKeyboardButton(text="2) Выбрать и удалить", callback_data="themes:section:manage")],
-            [InlineKeyboardButton(text="3) Информация", callback_data="themes:section:info")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+            [InlineKeyboardButton(text="✨ Создать и добавить", callback_data="themes:section:add")],
+            [InlineKeyboardButton(text="🗂 Выбрать и удалить", callback_data="themes:section:manage")],
+            [InlineKeyboardButton(text="ℹ️ Информация", callback_data="themes:section:info")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
         ]
     )
 
@@ -197,13 +179,13 @@ def _themes_menu_keyboard() -> InlineKeyboardMarkup:
 def _themes_add_section_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Создать тему", callback_data="themes:new")],
+            [InlineKeyboardButton(text="✨ Создать тему", callback_data="themes:new")],
             [
-                InlineKeyboardButton(text="Добавить чаты", callback_data="themes:quick:ac"),
-                InlineKeyboardButton(text="Добавить ключи", callback_data="themes:quick:ak"),
+                InlineKeyboardButton(text="💬 Добавить чаты", callback_data="themes:quick:ac"),
+                InlineKeyboardButton(text="🔑 Добавить ключи", callback_data="themes:quick:ak"),
             ],
-            [InlineKeyboardButton(text="Назад", callback_data="menu_themes")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_themes")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
         ]
     )
 
@@ -211,14 +193,14 @@ def _themes_add_section_keyboard() -> InlineKeyboardMarkup:
 def _themes_manage_section_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Выбрать тему", callback_data="themes:pick:sa")],
+            [InlineKeyboardButton(text="🎯 Выбрать тему", callback_data="themes:pick:sa")],
             [
-                InlineKeyboardButton(text="Удалить ключи", callback_data="themes:pick:dk"),
-                InlineKeyboardButton(text="Удалить чаты", callback_data="themes:pick:dc"),
+                InlineKeyboardButton(text="🗑 Удалить ключи", callback_data="themes:pick:dk"),
+                InlineKeyboardButton(text="🗑 Удалить чаты", callback_data="themes:pick:dc"),
             ],
-            [InlineKeyboardButton(text="Удалить тему", callback_data="themes:pick:dt")],
-            [InlineKeyboardButton(text="Назад", callback_data="menu_themes")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+            [InlineKeyboardButton(text="❌ Удалить тему", callback_data="themes:pick:dt")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_themes")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
         ]
     )
 
@@ -226,10 +208,10 @@ def _themes_manage_section_keyboard() -> InlineKeyboardMarkup:
 def _themes_info_section_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Список тем", callback_data="themes:list")],
-            [InlineKeyboardButton(text="Чаты поиска", callback_data="themes:search_chats")],
-            [InlineKeyboardButton(text="Назад", callback_data="menu_themes")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+            [InlineKeyboardButton(text="📚 Список тем", callback_data="themes:list")],
+            [InlineKeyboardButton(text="🔎 Чаты поиска", callback_data="themes:search_chats")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_themes")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
         ]
     )
 
@@ -237,9 +219,9 @@ def _themes_info_section_keyboard() -> InlineKeyboardMarkup:
 def _theme_add_chat_keyboard(theme_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="2) Добавить ВСЕ чаты аккаунта", callback_data=f"themes:add_all_chats:th:{theme_id}")],
-            [InlineKeyboardButton(text="Назад", callback_data="themes:section:add")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+            [InlineKeyboardButton(text="⚡ Добавить ВСЕ чаты аккаунта", callback_data=f"themes:add_all_chats:th:{theme_id}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="themes:section:add")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
         ]
     )
 
@@ -368,6 +350,30 @@ def _search_date_keyboard(output_format: str, scope: str, theme_id: int, limit_t
     )
 
 
+def _search_comments_mode_keyboard(
+    output_format: str,
+    scope: str,
+    theme_id: int,
+    limit_token: str,
+    date_token: str,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⚖️ Стандартный",
+                    callback_data=f"searchui:cm:{output_format}:{scope}:{theme_id}:{limit_token}:{date_token}:std",
+                ),
+                InlineKeyboardButton(
+                    text="🔎 Глубокий",
+                    callback_data=f"searchui:cm:{output_format}:{scope}:{theme_id}:{limit_token}:{date_token}:deep",
+                ),
+            ],
+            [InlineKeyboardButton(text="Назад", callback_data="menu_search")],
+        ]
+    )
+
+
 def _watch_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -481,6 +487,7 @@ def _parse_search_command(message_text: str, default_limit: int) -> ParsedSearch
     date_to: Optional[datetime] = None
     limit: Optional[int] = default_limit
     output_format = "both"
+    deep_comments = False
     no_limit_tokens = {
         "0",
         "none",
@@ -529,6 +536,8 @@ def _parse_search_command(message_text: str, default_limit: int) -> ParsedSearch
             output_format = tokens[idx].lower()
             if output_format not in {"both", "text", "csv"}:
                 raise ValueError("--format должен быть одним из: both, text, csv")
+        elif token == "--deep-comments":
+            deep_comments = True
         else:
             raise ValueError(f"Неизвестный параметр: {token}")
         idx += 1
@@ -542,11 +551,16 @@ def _parse_search_command(message_text: str, default_limit: int) -> ParsedSearch
         date_to=date_to,
         limit=limit,
         output_format=output_format,
+        deep_comments=deep_comments,
     )
 
 
 def _format_limit_value(limit: Optional[int]) -> str:
     return "без лимита" if limit is None else str(limit)
+
+
+def _format_comments_mode_value(deep_comments: bool) -> str:
+    return SEARCH_COMMENTS_MODE_LABELS["deep"] if deep_comments else SEARCH_COMMENTS_MODE_LABELS["std"]
 
 
 def _parse_limit_token(limit_token: str) -> Optional[int]:
@@ -612,6 +626,55 @@ def _format_search_date_range(date_from: Optional[datetime], date_to: Optional[d
     return f"{from_text} .. {to_text}"
 
 
+def _date_range_to_token(date_from: Optional[datetime], date_to: Optional[datetime]) -> str:
+    if date_from is None and date_to is None:
+        return "all"
+    left = date_from.astimezone(timezone.utc).strftime("%Y%m%d") if date_from else "start"
+    right = date_to.astimezone(timezone.utc).strftime("%Y%m%d") if date_to else "now"
+    return f"{left}-{right}"
+
+
+def _parse_date_range_token(token: str) -> tuple[Optional[datetime], Optional[datetime]]:
+    raw = (token or "").strip().casefold()
+    if raw == "all":
+        return None, None
+    parts = raw.split("-", maxsplit=1)
+    if len(parts) != 2:
+        raise ValueError("Некорректный диапазон дат.")
+    left, right = parts
+    date_from = None if left == "start" else parse_date_from(f"{left[:4]}-{left[4:6]}-{left[6:8]}")
+    date_to = None if right == "now" else parse_date_to(f"{right[:4]}-{right[4:6]}-{right[6:8]}")
+    return date_from, date_to
+
+
+def _search_comments_mode_prompt(limit: Optional[int], date_from: Optional[datetime], date_to: Optional[datetime]) -> str:
+    return (
+        f"Лимит: {_format_limit_value(limit)}\n"
+        f"Период: {_format_search_date_range(date_from, date_to)}\n\n"
+        "Выберите режим поиска по комментариям:\n"
+        "⚖️ Стандартный — быстрее\n"
+        "🔎 Глубокий — тщательнее ищет в комментариях, но работает дольше"
+    )
+
+
+def _format_search_start_text(
+    target_label: str,
+    output_format: str,
+    limit: Optional[int],
+    date_from: Optional[datetime],
+    date_to: Optional[datetime],
+    deep_comments: bool,
+) -> str:
+    return (
+        "🔎 Поиск запущен\n"
+        f"📌 Где искать: {target_label}\n"
+        f"📄 Формат: {SEARCH_FORMAT_LABELS[output_format]}\n"
+        f"🔢 Лимит: {_format_limit_value(limit)}\n"
+        f"📅 Период: {_format_search_date_range(date_from, date_to)}\n"
+        f"💬 Комментарии: {_format_comments_mode_value(deep_comments)}"
+    )
+
+
 def _validate_watch_interval(interval_minutes: int) -> None:
     if interval_minutes < MIN_WATCH_INTERVAL_MINUTES or interval_minutes > MAX_WATCH_INTERVAL_MINUTES:
         raise ValueError(
@@ -644,33 +707,42 @@ def _format_dt_utc(value: Optional[datetime]) -> str:
 
 def _watch_usage_text() -> str:
     return (
-        "Управление автопроверкой тем:\n"
-        "Кнопки: Подписки -> Включить/Отключить (включая кнопку 'Свой период').\n"
-        "/watch_set [theme] <minutes> - включить или обновить подписку\n"
-        "/watch_off [theme] - отключить подписку\n"
-        "/watch_list - показать активные подписки\n\n"
-        f"Интервал: {MIN_WATCH_INTERVAL_MINUTES}..{MAX_WATCH_INTERVAL_MINUTES} минут.\n"
-        "Если тема не указана, используется активная тема."
+        "🔔 Автопроверка тем\n"
+        "Бот может сам регулярно проверять ваши темы и присылать новые совпадения.\n\n"
+        "Как это работает:\n"
+        "1. Откройте раздел «Подписки».\n"
+        "2. Нажмите «Включить».\n"
+        "3. Выберите тему.\n"
+        "4. Укажите интервал проверки или нажмите «Свой период».\n\n"
+        "Что ещё можно сделать:\n"
+        "• посмотреть активные подписки\n"
+        "• отключить ненужную подписку\n"
+        "• изменить период проверки\n\n"
+        f"⏱ Доступный интервал: от {MIN_WATCH_INTERVAL_MINUTES} до {MAX_WATCH_INTERVAL_MINUTES} минут."
     )
 
 
 def _render_watch_list_text(watches: list[ThemeWatchDTO]) -> str:
     if not watches:
         return (
-            "У вас нет активных подписок на автопроверку.\n"
-            "Пример: /watch_set news 60"
+            "🔕 Активных подписок пока нет.\n\n"
+            "Чтобы бот сам проверял новые сообщения:\n"
+            "• откройте раздел «Подписки»\n"
+            "• нажмите «Включить»\n"
+            "• выберите тему и период проверки"
         )
 
-    lines = ["Подписки на автопроверку:"]
+    lines = ["🔔 Активные подписки:"]
     for idx, watch in enumerate(watches, start=1):
-        lines.append(f"{idx}. Тема '{watch.theme_name}' - каждые {watch.interval_minutes} мин")
-        lines.append(f"   Следующая проверка: {_format_dt_utc(watch.next_check_at)}")
+        lines.append(f"{idx}. {watch.theme_name}")
+        lines.append(f"   ⏱ Интервал: каждые {watch.interval_minutes} мин")
+        lines.append(f"   ⏭ Следующая проверка: {_format_dt_utc(watch.next_check_at)}")
         if watch.last_checked_at:
-            lines.append(f"   Последняя проверка: {_format_dt_utc(watch.last_checked_at)}")
+            lines.append(f"   🕓 Последняя проверка: {_format_dt_utc(watch.last_checked_at)}")
         if watch.last_match_at:
-            lines.append(f"   Последнее совпадение: {_format_dt_utc(watch.last_match_at)}")
+            lines.append(f"   ✅ Последнее совпадение: {_format_dt_utc(watch.last_match_at)}")
         if watch.last_error:
-            lines.append(f"   Последняя ошибка: {_short_text(watch.last_error, max_len=150)}")
+            lines.append(f"   ⚠️ Последняя ошибка: {_short_text(watch.last_error, max_len=150)}")
     return "\n".join(lines)
 
 
@@ -730,6 +802,12 @@ async def _edit_or_replace_watch_ui(
     if callback.message is None:
         return
     current = callback.message
+    if not nav_keyboard_mode_by_user.get(user_id):
+        nav_keyboard_mode_by_user[user_id] = True
+        await current.answer(
+            SILENT_UI_TEXT,
+            reply_markup=ReplyKeyboardRemove(),
+        )
     await _cleanup_previous_watch_ui_message(
         current.bot,
         user_id,
@@ -870,7 +948,7 @@ def _theme_action_prompt(action: str, theme_name: str) -> str:
             "Отправьте чаты для добавления.\n"
             "Разделители: ';' или перенос строки.\n"
             "Поддерживается: @username, id, точное имя, t.me-ссылка.\n"
-            "Или нажмите кнопку '2) Добавить ВСЕ чаты аккаунта'."
+            "Или нажмите кнопку 'Добавить ВСЕ чаты аккаунта'."
         )
     if action == "del_chat":
         return (
@@ -883,21 +961,33 @@ def _theme_action_prompt(action: str, theme_name: str) -> str:
 
 def _theme_wizard_keywords_prompt(theme_name: str) -> str:
     return (
-        f"Тема '{theme_name}' создана и выбрана активной.\n\n"
-        "Шаг 2/3: отправьте ключевые слова для поиска.\n"
-        "Разделители: ';', ',' или перенос строки.\n"
-        "Пример: Москва; погода; дрон\n\n"
-        "Если пропустить шаг: /skip"
+        f"✅ Тема '{theme_name}' создана и выбрана активной.\n\n"
+        "🔑 Шаг 2/3 — Ключевые слова\n"
+        "Отправьте слова или фразы для поиска одним сообщением.\n\n"
+        "Поддерживаются разделители:\n"
+        "• ';'\n"
+        "• ','\n"
+        "• перенос строки\n\n"
+        "Пример:\n"
+        "Москва; погода; дрон\n\n"
+        "⏭ Если хотите пропустить шаг, отправьте /skip"
     )
 
 
 def _theme_wizard_chats_prompt(theme_name: str) -> str:
     return (
-        f"Тема: {theme_name}\n\n"
-        "Шаг 3/3: отправьте чаты/каналы для поиска.\n"
-        "Разделители: ';' или перенос строки.\n"
-        "Поддерживается: @username, id, точное имя, t.me-ссылка.\n\n"
-        "Если пропустить шаг: /skip"
+        f"✅ Тема: {theme_name}\n\n"
+        "💬 Шаг 3/3 — Чаты и каналы\n"
+        "Отправьте чаты, в которых нужно искать сообщения.\n\n"
+        "Поддерживается формат:\n"
+        "• @username\n"
+        "• id\n"
+        "• точное имя\n"
+        "• ссылка t.me\n\n"
+        "Разделители:\n"
+        "• ';'\n"
+        "• перенос строки\n\n"
+        "⏭ Если хотите пропустить шаг, отправьте /skip"
     )
 
 
@@ -919,19 +1009,27 @@ async def _build_themes_panel_text(user_id: int) -> str:
         return (
             "Тем пока нет.\n\n"
             "Быстрый старт:\n"
-            "1) Откройте '1) Создать и добавить'\n"
+            "1) Откройте 'Создать и добавить'\n"
             "2) Создайте тему\n"
-            "3) В действии 'Добавить чаты' можно добавить чаты вручную или кнопкой '2) Добавить ВСЕ чаты аккаунта'\n"
+            "3) В действии 'Добавить чаты' можно добавить чаты вручную или кнопкой 'Добавить ВСЕ чаты аккаунта'\n"
             "4) Добавьте ключевые слова"
         )
     return (
         f"Темы: {len(themes)}\n"
-        f"Активная: {current or '(не выбрана)'}\n\n"
-        "Быстрый сценарий:\n"
-        "1) Откройте '1) Создать и добавить'\n"
-        "2) Добавьте чаты (вручную или кнопкой '2) Добавить ВСЕ чаты аккаунта')\n"
-        "3) Добавьте ключевые слова"
+        f"Активная: {current or '(не выбрана)'}"
     )
+
+
+async def _get_active_theme_for_user(user_id: int) -> Optional[ThemeDTO]:
+    _, database, _, _ = _require_services()
+    current = active_theme_by_user.get(user_id)
+    if not current:
+        return None
+    theme = await database.get_theme(user_id, current)
+    if theme is None:
+        active_theme_by_user.pop(user_id, None)
+        return None
+    return theme
 
 
 def _render_themes_compact_list(themes: list[ThemeDTO]) -> str:
@@ -1103,6 +1201,7 @@ async def _run_search_task(
     date_to: Optional[datetime],
     limit: Optional[int],
     output_format: str,
+    deep_comments: bool,
 ) -> None:
     _, database, _, _ = _require_services()
     theme = await database.get_theme(user_id, theme_name)
@@ -1122,6 +1221,7 @@ async def _run_search_task(
         date_to=date_to,
         limit=limit,
         output_format=output_format,
+        deep_comments=deep_comments,
     )
 
 
@@ -1170,6 +1270,7 @@ async def _run_search_all_chats_task(
     output_format: str,
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
+    deep_comments: bool = False,
 ) -> None:
     try:
         pseudo_theme = await _build_all_chats_theme(user_id)
@@ -1190,6 +1291,7 @@ async def _run_search_all_chats_task(
         date_to=date_to,
         limit=limit,
         output_format=output_format,
+        deep_comments=deep_comments,
     )
 
 
@@ -1204,6 +1306,7 @@ async def _create_ui_search_task(
     limit: Optional[int],
     date_from: Optional[datetime],
     date_to: Optional[datetime],
+    deep_comments: bool,
 ) -> tuple[str, asyncio.Task]:
     _, database, _, _ = _require_services()
     if scope == "th":
@@ -1211,10 +1314,13 @@ async def _create_ui_search_task(
         if theme is None:
             raise ValueError("Тема не найдена.")
         active_theme_by_user[user_id] = theme.name
-        text = (
-            f"Запускаю поиск по теме '{theme.name}' "
-            f"({SEARCH_FORMAT_LABELS[output_format]}, limit={_format_limit_value(limit)}, "
-            f"даты: {_format_search_date_range(date_from, date_to)})."
+        text = _format_search_start_text(
+            f"Тема '{theme.name}'",
+            output_format,
+            limit,
+            date_from,
+            date_to,
+            deep_comments,
         )
         task = asyncio.create_task(
             _run_search_task(
@@ -1226,14 +1332,18 @@ async def _create_ui_search_task(
                 date_to=date_to,
                 limit=limit,
                 output_format=output_format,
+                deep_comments=deep_comments,
             )
         )
         return text, task
 
-    text = (
-        "Запускаю поиск по всем чатам "
-        f"({SEARCH_FORMAT_LABELS[output_format]}, limit={_format_limit_value(limit)}, "
-        f"даты: {_format_search_date_range(date_from, date_to)})."
+    text = _format_search_start_text(
+        "Все чаты из всех тем",
+        output_format,
+        limit,
+        date_from,
+        date_to,
+        deep_comments,
     )
     task = asyncio.create_task(
         _run_search_all_chats_task(
@@ -1244,6 +1354,7 @@ async def _create_ui_search_task(
             output_format=output_format,
             date_from=date_from,
             date_to=date_to,
+            deep_comments=deep_comments,
         )
     )
     return text, task
@@ -1259,6 +1370,7 @@ async def _run_search_with_theme(
     date_to: Optional[datetime],
     limit: Optional[int],
     output_format: str,
+    deep_comments: bool,
 ) -> None:
     _, database, _, search = _require_services()
     run_id = await database.create_search_run(user_id=user_id, theme_name=run_theme_name)
@@ -1279,7 +1391,7 @@ async def _run_search_with_theme(
         items, csv_path = await search.run_theme_search(
             user_id=user_id,
             theme=theme,
-            params=SearchParams(limit=limit, date_from=date_from, date_to=date_to),
+            params=SearchParams(limit=limit, date_from=date_from, date_to=date_to, deep_comments=deep_comments),
             progress_cb=on_progress,
         )
 
@@ -1466,25 +1578,24 @@ async def cmd_start(message: Message) -> None:
     status = "Авторизован" if is_auth else "Не авторизован"
     if is_auth:
         steps = (
-            "1) Создайте тему и добавьте чаты/ключевые слова.\n"
-            "2) Запустите /search <theme>.\n"
-            "3) Для регулярной проверки: /watch_set <theme> <minutes>."
+            "• откройте 'Темы' и настройте тему\n"
+            "• откройте 'Поиск' и запустите поиск\n"
+            "• откройте 'Подписки', если нужна регулярная проверка"
         )
     else:
         steps = (
-            "1) Нажмите Авторизация и пройдите QR.\n"
-            "2) Создайте тему и добавьте чаты/ключевые слова.\n"
-            "3) Запустите /search <theme>.\n"
-            "4) Для регулярной проверки: /watch_set <theme> <minutes>."
+            "• нажмите 'Авторизация' и пройдите вход\n"
+            "• затем откройте 'Темы' и создайте тему\n"
+            "• после этого используйте 'Поиск' или 'Подписки'"
         )
 
     await _send_watch_ui_message(
         message,
         user_id,
-        "Привет. Это бот для поиска по Telegram-аккаунту пользователя.\n"
-        f"Статус аккаунта: {status}\n\n"
-        f"{steps}\n\n"
-        "Команда помощи: /help",
+        "👋 Бот для поиска по вашему Telegram-аккаунту\n"
+        f"🔐 Статус: {status}\n\n"
+        "Что можно сделать дальше:\n"
+        f"{steps}",
         _main_menu(show_auth_actions=not is_auth),
         nav_show_auth_actions=not is_auth,
         nav_force=True,
@@ -1497,9 +1608,11 @@ def _help_text() -> str:
         "1) Сначала пройдите авторизацию через QR-код.\n"
         "2) Откройте раздел 'Темы' и создайте тему.\n"
         "3) Добавьте ключевые слова и чаты для поиска.\n"
-        "4) Перейдите в раздел 'Поиск': выберите тему (или все чаты), формат, лимит и период дат.\n"
+        "4) Перейдите в раздел 'Поиск': выберите тему (или все чаты), формат, лимит, период дат и режим комментариев.\n"
         "5) Бот пришлет найденные сообщения и файл CSV.\n\n"
-        "В разделе 'Темы' -> '1) Создать и добавить' в действии 'Добавить чаты' есть кнопка '2) Добавить ВСЕ чаты аккаунта'.\n"
+        "В разделе 'Темы' -> 'Создать и добавить' в действии 'Добавить чаты' есть кнопка 'Добавить ВСЕ чаты аккаунта'.\n"
+        "Если у канала есть обсуждение постов, комментарии к постам тоже ищутся автоматически.\n"
+        "Режим 'Глубокий' в поиске проверяет комментарии тщательнее, но работает медленнее.\n"
         "В разделе 'Подписки' можно включить регулярную автопроверку: бот будет сам присылать новые совпадения.\n\n"
         "Подсказки:\n"
         "- Чаты можно задавать как @username, id, точное название или ссылку t.me.\n"
@@ -2257,8 +2370,11 @@ async def cb_themes_section_add(callback: CallbackQuery) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Раздел 1/3: создание темы и добавление данных.\n"
-            "Шаги: создайте тему, добавьте чаты, добавьте ключевые слова.",
+            "✨ Раздел 1/3 — Создание и наполнение темы\n\n"
+            "Что можно сделать:\n"
+            "• создать новую тему\n"
+            "• добавить чаты для поиска\n"
+            "• добавить ключевые слова",
             _themes_add_section_keyboard(),
         )
     await callback.answer()
@@ -2271,8 +2387,12 @@ async def cb_themes_section_manage(callback: CallbackQuery) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Раздел 2/3: выбор темы и удаление данных.\n"
-            "Здесь можно выбрать активную тему и удалять ключи/чаты/тему.",
+            "🗂 Раздел 2/3 — Выбор и удаление\n\n"
+            "Здесь можно:\n"
+            "• выбрать активную тему\n"
+            "• удалить ключевые слова\n"
+            "• удалить чаты\n"
+            "• удалить тему целиком",
             _themes_manage_section_keyboard(),
         )
     await callback.answer()
@@ -2285,8 +2405,10 @@ async def cb_themes_section_info(callback: CallbackQuery) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Раздел 3/3: информация по темам.\n"
-            "Здесь можно посмотреть список тем и чаты, по которым идет поиск.",
+            "ℹ️ Раздел 3/3 — Информация\n\n"
+            "Здесь можно посмотреть:\n"
+            "• список всех тем\n"
+            "• чаты, по которым идет поиск",
             _themes_info_section_keyboard(),
         )
     await callback.answer()
@@ -2442,6 +2564,12 @@ async def cb_themes_add_all_chats(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
+    active_theme = await _get_active_theme_for_user(user_id)
+    if active_theme is not None:
+        await callback.answer("Запускаю импорт чатов...", show_alert=False)
+        await _add_all_account_chats_to_theme_via_callback(callback, user_id, active_theme)
+        return
+
     if len(themes) == 1:
         await callback.answer("Запускаю импорт чатов...", show_alert=False)
         await _add_all_account_chats_to_theme_via_callback(callback, user_id, themes[0])
@@ -2517,6 +2645,16 @@ async def cb_themes_quick(callback: CallbackQuery, state: FSMContext) -> None:
             "Сначала создайте тему: нажмите 'Создать тему'.",
             _themes_add_section_keyboard(),
         )
+        await callback.answer()
+        return
+
+    active_theme = await _get_active_theme_for_user(user_id)
+    if active_theme is not None:
+        active_theme_by_user[user_id] = active_theme.name
+        await state.set_state(ThemeUiStates.waiting_bulk_payload)
+        await state.update_data(theme_ui_action=action, theme_name=active_theme.name)
+        next_markup = _theme_add_chat_keyboard(active_theme.id) if action == "add_chat" else _themes_add_section_keyboard()
+        await _edit_or_replace_watch_ui(callback, user_id, _theme_action_prompt(action, active_theme.name), next_markup)
         await callback.answer()
         return
 
@@ -3470,25 +3608,24 @@ async def cb_search_date(callback: CallbackQuery, state: FSMContext) -> None:
 
     try:
         date_from, date_to = _preset_date_range(preset)
-        start_text, task = await _create_ui_search_task(
-            bot=callback.message.bot,
-            user_id=user_id,
-            chat_id=callback.message.chat.id,
-            scope=scope,
-            payload_id=payload_id,
-            output_format=output_format,
-            limit=limit,
-            date_from=date_from,
-            date_to=date_to,
-        )
     except Exception as e:
         await _edit_or_replace_watch_ui(callback, user_id, f"Ошибка запуска поиска: {e}", _search_menu_keyboard())
         await callback.answer()
         return
 
     await state.clear()
-    active_search_tasks[user_id] = task
-    await _edit_or_replace_watch_ui(callback, user_id, start_text, _search_menu_keyboard())
+    await _edit_or_replace_watch_ui(
+        callback,
+        user_id,
+        _search_comments_mode_prompt(limit, date_from, date_to),
+        _search_comments_mode_keyboard(
+            output_format,
+            scope,
+            payload_id,
+            _limit_to_token(limit),
+            _date_range_to_token(date_from, date_to),
+        ),
+    )
     await callback.answer()
 
 
@@ -3530,26 +3667,87 @@ async def st_search_custom_dates(message: Message, state: FSMContext) -> None:
         await _send_watch_ui_message(message, user_id, "Поиск уже выполняется. Остановите его через /cancel.", _search_menu_keyboard())
         return
 
+    await state.clear()
+    await _send_watch_ui_message(
+        message,
+        user_id,
+        _search_comments_mode_prompt(limit, date_from, date_to),
+        _search_comments_mode_keyboard(
+            output_format,
+            scope,
+            payload_id,
+            _limit_to_token(limit),
+            _date_range_to_token(date_from, date_to),
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("searchui:cm:"))
+async def cb_search_comments_mode(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    parts = (callback.data or "").split(":")
+    if len(parts) != 8:
+        await callback.answer("Некорректный callback", show_alert=False)
+        return
+
+    _, _, output_format, scope, payload_raw, limit_token, date_token, comments_mode = parts
+    if output_format not in SEARCH_FORMAT_LABELS or scope not in {"th", "all"}:
+        await callback.answer("Некорректные параметры", show_alert=False)
+        return
+    if comments_mode not in SEARCH_COMMENTS_MODE_LABELS:
+        await callback.answer("Некорректный режим", show_alert=False)
+        return
+
+    try:
+        payload_id = int(payload_raw)
+        limit = _parse_limit_token(limit_token)
+        date_from, date_to = _parse_date_range_token(date_token)
+    except Exception:
+        await callback.answer("Некорректные параметры", show_alert=False)
+        return
+
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    _, _, auth, _ = _require_services()
+    if not await auth.is_authorized(user_id):
+        await _edit_or_replace_watch_ui(callback, user_id, "Сначала авторизуйте аккаунт через /auth.", _main_menu())
+        await callback.answer()
+        return
+
+    current_task = active_search_tasks.get(user_id)
+    if current_task and not current_task.done():
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            "Поиск уже выполняется. Остановите его через /cancel.",
+            _search_menu_keyboard(),
+        )
+        await callback.answer()
+        return
+
     try:
         start_text, task = await _create_ui_search_task(
-            bot=message.bot,
+            bot=callback.message.bot,
             user_id=user_id,
-            chat_id=message.chat.id,
+            chat_id=callback.message.chat.id,
             scope=scope,
             payload_id=payload_id,
             output_format=output_format,
             limit=limit,
             date_from=date_from,
             date_to=date_to,
+            deep_comments=(comments_mode == "deep"),
         )
     except Exception as e:
-        await state.clear()
-        await _send_watch_ui_message(message, user_id, f"Ошибка запуска поиска: {e}", _search_menu_keyboard())
+        await _edit_or_replace_watch_ui(callback, user_id, f"Ошибка запуска поиска: {e}", _search_menu_keyboard())
+        await callback.answer()
         return
 
-    await state.clear()
     active_search_tasks[user_id] = task
-    await _send_watch_ui_message(message, user_id, start_text, _search_menu_keyboard())
+    await _edit_or_replace_watch_ui(callback, user_id, start_text, _search_menu_keyboard())
+    await callback.answer()
 
 
 @router.message(Command("search"))
@@ -3582,8 +3780,14 @@ async def cmd_search(message: Message) -> None:
         return
 
     await message.answer(
-        f"Запускаю поиск по теме '{theme.name}' "
-        f"(limit={_format_limit_value(parsed.limit)}, format={parsed.output_format})."
+        _format_search_start_text(
+            f"Тема '{theme.name}'",
+            parsed.output_format,
+            parsed.limit,
+            parsed.date_from,
+            parsed.date_to,
+            parsed.deep_comments,
+        )
     )
     task = asyncio.create_task(
         _run_search_task(
@@ -3595,6 +3799,7 @@ async def cmd_search(message: Message) -> None:
             date_to=parsed.date_to,
             limit=parsed.limit,
             output_format=parsed.output_format,
+            deep_comments=parsed.deep_comments,
         )
     )
     active_search_tasks[user_id] = task
