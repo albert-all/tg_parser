@@ -27,6 +27,26 @@ class User(Base):
 
     themes: Mapped[list["Theme"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     theme_watches: Mapped[list["ThemeWatch"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    settings: Mapped[Optional["UserSettings"]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.tg_user_id", ondelete="CASCADE"), primary_key=True)
+    search_output_format: Mapped[str] = mapped_column(String(16), default="both")
+    watch_output_format: Mapped[str] = mapped_column(String(16), default="both")
+    watch_interval_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+    user: Mapped["User"] = relationship(back_populates="settings")
 
 
 class Theme(Base):
@@ -135,6 +155,13 @@ class ThemeWatchDTO:
     last_error: Optional[str]
 
 
+@dataclass
+class UserSettingsDTO:
+    search_output_format: str
+    watch_output_format: str
+    watch_interval_minutes: int
+
+
 class Database:
     def __init__(self, database_url: str) -> None:
         self.engine = create_async_engine(database_url, pool_pre_ping=True)
@@ -163,6 +190,75 @@ class Database:
                 user.first_name = first_name
                 user.updated_at = datetime.now(timezone.utc)
             await session.commit()
+
+    @staticmethod
+    def _settings_to_dto(settings: Optional[UserSettings], default_watch_interval_minutes: int) -> UserSettingsDTO:
+        if settings is None:
+            return UserSettingsDTO(
+                search_output_format="both",
+                watch_output_format="both",
+                watch_interval_minutes=default_watch_interval_minutes,
+            )
+        return UserSettingsDTO(
+            search_output_format=settings.search_output_format or "both",
+            watch_output_format=settings.watch_output_format or "both",
+            watch_interval_minutes=settings.watch_interval_minutes or default_watch_interval_minutes,
+        )
+
+    async def get_user_settings(self, user_id: int, default_watch_interval_minutes: int) -> UserSettingsDTO:
+        async with self.session() as session:
+            settings = await session.get(UserSettings, user_id)
+            return self._settings_to_dto(settings, default_watch_interval_minutes)
+
+    async def _get_or_create_user_settings(
+        self,
+        session: AsyncSession,
+        user_id: int,
+        default_watch_interval_minutes: int,
+    ) -> UserSettings:
+        settings = await session.get(UserSettings, user_id)
+        if settings is not None:
+            return settings
+        settings = UserSettings(
+            user_id=user_id,
+            search_output_format="both",
+            watch_output_format="both",
+            watch_interval_minutes=default_watch_interval_minutes,
+        )
+        session.add(settings)
+        return settings
+
+    async def set_search_output_format(self, user_id: int, output_format: str, default_watch_interval_minutes: int) -> UserSettingsDTO:
+        async with self.session() as session:
+            settings = await self._get_or_create_user_settings(session, user_id, default_watch_interval_minutes)
+            settings.search_output_format = output_format
+            settings.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(settings)
+            return self._settings_to_dto(settings, default_watch_interval_minutes)
+
+    async def set_watch_output_format(self, user_id: int, output_format: str, default_watch_interval_minutes: int) -> UserSettingsDTO:
+        async with self.session() as session:
+            settings = await self._get_or_create_user_settings(session, user_id, default_watch_interval_minutes)
+            settings.watch_output_format = output_format
+            settings.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(settings)
+            return self._settings_to_dto(settings, default_watch_interval_minutes)
+
+    async def set_watch_interval_minutes(
+        self,
+        user_id: int,
+        interval_minutes: int,
+        default_watch_interval_minutes: int,
+    ) -> UserSettingsDTO:
+        async with self.session() as session:
+            settings = await self._get_or_create_user_settings(session, user_id, default_watch_interval_minutes)
+            settings.watch_interval_minutes = interval_minutes
+            settings.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(settings)
+            return self._settings_to_dto(settings, default_watch_interval_minutes)
 
     async def create_theme(self, user_id: int, name: str) -> ThemeDTO:
         name = name.strip()
@@ -302,6 +398,15 @@ class Database:
             await session.commit()
             return result.rowcount > 0
 
+    async def clear_chats(self, user_id: int, theme_name: str) -> int:
+        theme = await self.get_theme(user_id, theme_name)
+        if theme is None:
+            raise ValueError("Theme not found")
+        async with self.session() as session:
+            result = await session.execute(delete(ThemeChat).where(ThemeChat.theme_id == theme.id))
+            await session.commit()
+            return result.rowcount or 0
+
     async def add_keyword(self, user_id: int, theme_name: str, keyword: str) -> None:
         theme = await self.get_theme(user_id, theme_name)
         if theme is None:
@@ -335,6 +440,15 @@ class Database:
             await session.commit()
             return result.rowcount > 0
 
+    async def clear_keywords(self, user_id: int, theme_name: str) -> int:
+        theme = await self.get_theme(user_id, theme_name)
+        if theme is None:
+            raise ValueError("Theme not found")
+        async with self.session() as session:
+            result = await session.execute(delete(ThemeKeyword).where(ThemeKeyword.theme_id == theme.id))
+            await session.commit()
+            return result.rowcount or 0
+
     async def create_search_run(self, user_id: int, theme_name: str) -> int:
         async with self.session() as session:
             run = SearchRun(user_id=user_id, theme_name=theme_name, status="running")
@@ -366,6 +480,28 @@ class Database:
             result = await session.execute(delete(SearchRun).where(SearchRun.started_at < border))
             await session.commit()
             return result.rowcount or 0
+
+    async def get_latest_search_run_statuses(self, user_id: int) -> dict[str, str]:
+        async with self.session() as session:
+            runs = list(
+                (
+                    await session.scalars(
+                        select(SearchRun)
+                        .where(SearchRun.user_id == user_id)
+                        .order_by(SearchRun.started_at.desc(), SearchRun.id.desc())
+                    )
+                ).all()
+            )
+            result: dict[str, str] = {}
+            for run in runs:
+                name = (run.theme_name or "").strip()
+                if not name:
+                    continue
+                key = name.casefold()
+                if key in result:
+                    continue
+                result[key] = run.status
+            return result
 
     @staticmethod
     def _watch_to_dto(watch: ThemeWatch, theme_name: str) -> ThemeWatchDTO:
@@ -416,6 +552,22 @@ class Database:
             await session.commit()
             await session.refresh(watch)
             return self._watch_to_dto(watch, theme.name)
+
+    async def update_all_theme_watches_interval(self, user_id: int, interval_minutes: int) -> int:
+        if interval_minutes <= 0:
+            raise ValueError("Interval must be > 0")
+        now = datetime.now(timezone.utc)
+        next_check_at = now + timedelta(minutes=interval_minutes)
+        async with self.session() as session:
+            watches = list((await session.scalars(select(ThemeWatch).where(ThemeWatch.user_id == user_id))).all())
+            if not watches:
+                return 0
+            for watch in watches:
+                watch.interval_minutes = interval_minutes
+                watch.next_check_at = next_check_at
+                watch.updated_at = now
+            await session.commit()
+            return len(watches)
 
     async def delete_theme_watch(self, user_id: int, theme_name: str) -> bool:
         theme = await self.get_theme(user_id, theme_name)

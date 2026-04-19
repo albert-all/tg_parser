@@ -13,7 +13,7 @@ from telethon.errors import FloodWaitError
 
 from bot_backend.db import ThemeDTO
 
-WORD_RE = re.compile(r"[a-zР°-СЏ0-9]+")
+WORD_RE = re.compile(r"[a-zа-яё0-9]+")
 DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -75,7 +75,7 @@ def parse_date_to(value: str) -> datetime:
 
 def validate_date_range(date_from: Optional[datetime], date_to: Optional[datetime]) -> None:
     if date_from and date_to and date_from > date_to:
-        raise SearchError("РќРµРєРѕСЂСЂРµРєС‚РЅС‹Р№ РґРёР°РїР°Р·РѕРЅ: date-from РїРѕР·Р¶Рµ date-to.")
+        raise SearchError("Некорректный диапазон дат: дата начала позже даты конца.")
 
 
 def in_date_range(msg_date: datetime, date_from: Optional[datetime], date_to: Optional[datetime]) -> bool:
@@ -98,7 +98,7 @@ def iter_offset_date(date_to: Optional[datetime]) -> Optional[datetime]:
 
 
 def normalize_text(value: str) -> str:
-    return (value or "").lower().replace("С‘", "Рµ")
+    return (value or "").lower().replace("ё", "е")
 
 
 def normalize_theme_for_filename(theme: str) -> str:
@@ -246,7 +246,7 @@ class SearchService:
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                raise SearchError("РђРєРєР°СѓРЅС‚ РЅРµ Р°РІС‚РѕСЂРёР·РѕРІР°РЅ. РЎРЅР°С‡Р°Р»Р° РІС‹РїРѕР»РЅРёС‚Рµ /auth.")
+                raise SearchError("Аккаунт не авторизован. Сначала выполните авторизацию в боте.")
 
             refs: list[str] = []
             seen: set[str] = set()
@@ -287,29 +287,29 @@ class SearchService:
     ) -> tuple[list[SearchItem], Path]:
         validate_date_range(params.date_from, params.date_to)
         if params.limit is not None and params.limit <= 0:
-            raise SearchError("Р›РёРјРёС‚ РґРѕР»Р¶РµРЅ Р±С‹С‚СЊ > 0, Р»РёР±Рѕ None РґР»СЏ РїРѕРёСЃРєР° Р±РµР· Р»РёРјРёС‚Р°.")
+            raise SearchError("Лимит должен быть больше нуля или отсутствовать для поиска без лимита.")
         if not theme.chats:
-            raise SearchError("Р’ С‚РµРјРµ РЅРµС‚ С‡Р°С‚РѕРІ.")
+            raise SearchError("В теме нет чатов.")
         if not theme.keywords:
-            raise SearchError("Р’ С‚РµРјРµ РЅРµС‚ РєР»СЋС‡РµРІС‹С… СЃР»РѕРІ.")
+            raise SearchError("В теме нет ключевых слов.")
 
         prepared_keywords = prepare_keywords(theme.keywords)
         if not prepared_keywords:
-            raise SearchError("РЎРїРёСЃРѕРє РєР»СЋС‡РµРІС‹С… СЃР»РѕРІ РїСѓСЃС‚ РїРѕСЃР»Рµ РЅРѕСЂРјР°Р»РёР·Р°С†РёРё.")
+            raise SearchError("Список ключевых слов пуст после нормализации.")
         search_keywords = [kw for kw, _, _ in prepared_keywords]
 
         client = self._new_client(user_id)
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                raise SearchError("РђРєРєР°СѓРЅС‚ РЅРµ Р°РІС‚РѕСЂРёР·РѕРІР°РЅ. РЎРЅР°С‡Р°Р»Р° РІС‹РїРѕР»РЅРёС‚Рµ /auth.")
+                raise SearchError("Аккаунт не авторизован. Сначала выполните авторизацию в боте.")
 
             entities = await self._resolve_entities(client, theme.chats)
             if not entities:
-                raise SearchError("РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕР»СѓС‡РёС‚СЊ РЅРё РѕРґРёРЅ С‡Р°С‚ РёР· С‚РµРјС‹.")
+                raise SearchError("Не удалось получить ни один чат из темы.")
             targets = await self._build_search_targets(client, entities)
             if not targets:
-                raise SearchError("РќРµ СѓРґР°Р»РѕСЃСЊ РїРѕРґРіРѕС‚РѕРІРёС‚СЊ РЅРё РѕРґРёРЅ РёСЃС‚РѕС‡РЅРёРє СЃРѕРѕР±С‰РµРЅРёР№ РґР»СЏ РїРѕРёСЃРєР°.")
+                raise SearchError("Не удалось подготовить ни один источник сообщений для поиска.")
 
             collected: dict[tuple[int, int], dict] = {}
             match_cache: dict[tuple[int, int], list[str]] = {}
@@ -328,7 +328,7 @@ class SearchService:
                             continue
                         scanned_comments += 1
                         if progress_cb and scanned_comments % 500 == 0:
-                            await progress_cb(f"РџСЂРѕСЃРјРѕС‚СЂРµРЅРѕ РєРѕРјРјРµРЅС‚Р°СЂРёРµРІ: {scanned_comments}")
+                            await progress_cb(f"Просмотрено комментариев: {scanned_comments}")
                         if should_stop_by_lower_bound(msg.date, params.date_from):
                             break
                         if not in_date_range(msg.date, params.date_from, params.date_to):
@@ -485,7 +485,7 @@ class SearchService:
                 SearchTarget(
                     chat_ref=chat_ref,
                     entity=discussion_entity,
-                    display_chat=f"{entity_display_name(entity, chat_ref)} / РєРѕРјРјРµРЅС‚Р°СЂРёРё",
+                    display_chat=f"{entity_display_name(entity, chat_ref)} / комментарии",
                     mode="comments",
                     source_channel_id=source_channel_id,
                 )

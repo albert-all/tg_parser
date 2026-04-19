@@ -28,7 +28,7 @@ from aiogram.types import (
 
 from bot_backend.auth import AuthManager
 from bot_backend.config import Settings, load_settings
-from bot_backend.db import Database, ThemeDTO, ThemeWatchDTO
+from bot_backend.db import Database, ThemeDTO, ThemeWatchDTO, UserSettingsDTO
 from bot_backend.search import SearchError, SearchParams, SearchService, parse_date_from, parse_date_to
 
 router = Router()
@@ -39,6 +39,7 @@ db: Optional[Database] = None
 auth_manager: Optional[AuthManager] = None
 search_service: Optional[SearchService] = None
 active_search_tasks: dict[int, asyncio.Task] = {}
+active_search_themes_by_user: dict[int, set[str]] = {}
 active_theme_by_user: dict[int, str] = {}
 watch_scheduler_task: Optional[asyncio.Task] = None
 watch_ui_message_by_user: dict[int, tuple[int, int]] = {}
@@ -49,6 +50,8 @@ MAX_WATCH_INTERVAL_MINUTES = 60 * 24 * 7
 WATCH_SCHEDULER_SLEEP_SECONDS = 20
 WATCH_INTERVAL_OPTIONS = (15, 30, 60, 180, 360, 720, 1440)
 SEARCH_LIMIT_OPTIONS = (20, 50, 100, 200, 500)
+DEFAULT_WATCH_INTERVAL_MINUTES = 60
+ACTIVE_SEARCH_ALL_MARKER = "__all__"
 
 
 class AuthStates(StatesGroup):
@@ -69,6 +72,10 @@ class WatchUiStates(StatesGroup):
 class SearchUiStates(StatesGroup):
     waiting_custom_limit = State()
     waiting_custom_dates = State()
+
+
+class SettingsUiStates(StatesGroup):
+    waiting_watch_interval = State()
 
 
 THEME_UI_ACTION_MAP = {
@@ -105,29 +112,28 @@ class ParsedSearchCommand:
 
 
 def _main_menu(*, show_auth_actions: bool = True) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
     if show_auth_actions:
-        rows.append(
-            [
-                InlineKeyboardButton(text="Авторизация", callback_data="menu_auth"),
-                InlineKeyboardButton(text="Проверить QR", callback_data="menu_auth_check"),
-                InlineKeyboardButton(text="Обновить QR", callback_data="menu_auth_refresh"),
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="👤 Авторизация", callback_data="menu_auth"),
+                    InlineKeyboardButton(text="❓ Помощь", callback_data="menu_help"),
+                ],
             ]
         )
-    rows.extend(
-        [
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                InlineKeyboardButton(text="Темы", callback_data="menu_themes"),
-                InlineKeyboardButton(text="Поиск", callback_data="menu_search"),
+                InlineKeyboardButton(text="🔔 Подписки", callback_data="menu_watch"),
+                InlineKeyboardButton(text="🔍 Поиск", callback_data="menu_search"),
             ],
             [
-                InlineKeyboardButton(text="Подписки", callback_data="menu_watch"),
-                InlineKeyboardButton(text="Отменить поиск", callback_data="menu_cancel"),
+                InlineKeyboardButton(text="☰ Темы", callback_data="menu_themes"),
+                InlineKeyboardButton(text="❓ Помощь", callback_data="menu_help"),
             ],
-            [InlineKeyboardButton(text="Помощь", callback_data="menu_help")],
+            [InlineKeyboardButton(text="⚙️ Общие настройки", callback_data="menu_settings")],
         ]
     )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _main_menu_for_user(user_id: int) -> InlineKeyboardMarkup:
@@ -156,11 +162,29 @@ def _auth_actions_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Проверить QR", callback_data="menu_auth_check"),
-                InlineKeyboardButton(text="Обновить QR", callback_data="menu_auth_refresh"),
+                InlineKeyboardButton(text="✅ Отсканировал", callback_data="menu_auth_check"),
+                InlineKeyboardButton(text="🔄 Обновить QR", callback_data="menu_auth_refresh"),
             ],
-            [InlineKeyboardButton(text="Ввести 2FA", callback_data="menu_auth_2fa")],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+            [InlineKeyboardButton(text="❓ Помощь", callback_data="menu_help")],
+        ]
+    )
+
+
+def _help_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
+        ]
+    )
+
+
+def _themes_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⬅️ К темам", callback_data="menu_themes"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+            ],
         ]
     )
 
@@ -168,10 +192,110 @@ def _auth_actions_menu() -> InlineKeyboardMarkup:
 def _themes_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✨ Создать и добавить", callback_data="themes:section:add")],
-            [InlineKeyboardButton(text="🗂 Выбрать и удалить", callback_data="themes:section:manage")],
-            [InlineKeyboardButton(text="ℹ️ Информация", callback_data="themes:section:info")],
+            [InlineKeyboardButton(text="➕ Добавить тему", callback_data="themes:new")],
+            [InlineKeyboardButton(text="🔎 Чаты поиска", callback_data="themes:search_chats")],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_home"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+            ],
+        ]
+    )
+
+
+def _theme_wizard_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Отменить", callback_data="menu_cancel")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
+        ]
+    )
+
+
+def _themes_panel_keyboard(
+    themes: list[ThemeDTO],
+    active_theme_name: Optional[str],
+    status_labels: Optional[dict[int, str]] = None,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for theme in themes:
+        is_active = bool(active_theme_name and active_theme_name.casefold() == theme.name.casefold())
+        if status_labels and theme.id in status_labels:
+            label = status_labels[theme.id]
+        else:
+            label = f"✅ {theme.name}" if is_active else theme.name
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"themes:open:{theme.id}")])
+    rows.append([InlineKeyboardButton(text="➕ Добавить тему", callback_data="themes:new")])
+    rows.append([InlineKeyboardButton(text="🔎 Чаты поиска", callback_data="themes:search_chats")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_home"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _theme_detail_keyboard(theme_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔑 Изменить ключи", callback_data=f"themes:keys:{theme_id}"),
+                InlineKeyboardButton(text="💬 Изменить чаты", callback_data=f"themes:chats:{theme_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🔍 Начать поиск", callback_data=f"searchui:th:{theme_id}"),
+                InlineKeyboardButton(text="🔔 Отслеживать", callback_data=f"watch:set:th:{theme_id}"),
+            ],
+            [InlineKeyboardButton(text="🗑️ Удалить тему", callback_data=f"themes:delete:ask:{theme_id}")],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_themes"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+            ],
+        ]
+    )
+
+
+def _theme_keywords_keyboard(theme_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Добавить ключи", callback_data=f"themes:keys:add:{theme_id}"),
+                InlineKeyboardButton(text="✂️ Удалить выборочно", callback_data=f"themes:keys:del:{theme_id}"),
+            ],
+            [InlineKeyboardButton(text="🗑️ Удалить все ключи", callback_data=f"themes:keys:clear:{theme_id}")],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=f"themes:open:{theme_id}"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+            ],
+        ]
+    )
+
+
+def _theme_chats_keyboard(theme_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Добавить чаты", callback_data=f"themes:chats:add:{theme_id}"),
+                InlineKeyboardButton(text="✂️ Удалить выборочно", callback_data=f"themes:chats:del:{theme_id}"),
+            ],
+            [InlineKeyboardButton(text="⚡ Добавить все чаты аккаунта", callback_data=f"themes:add_all_chats:th:{theme_id}")],
+            [InlineKeyboardButton(text="🗑️ Удалить все чаты", callback_data=f"themes:chats:clear:{theme_id}")],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=f"themes:open:{theme_id}"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+            ],
+        ]
+    )
+
+
+def _theme_delete_confirm_keyboard(theme_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, удалить тему", callback_data=f"themes:delete:yes:{theme_id}")],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=f"themes:open:{theme_id}"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+            ],
         ]
     )
 
@@ -216,11 +340,12 @@ def _themes_info_section_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _theme_add_chat_keyboard(theme_id: int) -> InlineKeyboardMarkup:
+def _theme_add_chat_keyboard(theme_id: int, back_callback: Optional[str] = None) -> InlineKeyboardMarkup:
+    back_target = back_callback or f"themes:open:{theme_id}"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⚡ Добавить ВСЕ чаты аккаунта", callback_data=f"themes:add_all_chats:th:{theme_id}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="themes:section:add")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_target)],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
         ]
     )
@@ -246,10 +371,10 @@ def _search_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Выбрать тему", callback_data="searchui:pick_theme"),
-                InlineKeyboardButton(text="Все чаты", callback_data="searchui:all"),
+                InlineKeyboardButton(text="🎯 Выбрать тему", callback_data="searchui:pick_theme"),
+                InlineKeyboardButton(text="🌐 Все чаты", callback_data="searchui:all"),
             ],
-            [InlineKeyboardButton(text="Главное меню", callback_data="menu_home")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
         ]
     )
 
@@ -258,7 +383,12 @@ def _search_theme_picker_keyboard(themes: list[ThemeDTO]) -> InlineKeyboardMarku
     rows: list[list[InlineKeyboardButton]] = []
     for theme in themes:
         rows.append([InlineKeyboardButton(text=theme.name, callback_data=f"searchui:th:{theme.id}")])
-    rows.append([InlineKeyboardButton(text="Назад", callback_data="menu_search")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_search"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -441,6 +571,27 @@ async def _upsert_user(user_id: int, username: Optional[str], first_name: Option
     return user_id
 
 
+async def _clear_settings_state_if_needed(state: FSMContext) -> None:
+    current_state = await state.get_state()
+    if current_state and current_state.startswith(f"{SettingsUiStates.__name__}:"):
+        await state.clear()
+
+
+def _set_active_search_themes(user_id: int, theme_names: Optional[list[str]] = None, *, all_themes: bool = False) -> None:
+    if all_themes:
+        active_search_themes_by_user[user_id] = {ACTIVE_SEARCH_ALL_MARKER}
+        return
+    names = {(name or "").strip().casefold() for name in (theme_names or []) if (name or "").strip()}
+    if names:
+        active_search_themes_by_user[user_id] = names
+    else:
+        active_search_themes_by_user.pop(user_id, None)
+
+
+def _clear_active_search_themes(user_id: int) -> None:
+    active_search_themes_by_user.pop(user_id, None)
+
+
 def _short_text(text: str, max_len: int = 280) -> str:
     text = (text or "").replace("\n", " ").strip()
     if len(text) <= max_len:
@@ -474,7 +625,7 @@ def _parse_theme_and_value(body: str) -> tuple[str, str]:
     return theme_name, value
 
 
-def _parse_search_command(message_text: str, default_limit: int) -> ParsedSearchCommand:
+def _parse_search_command(message_text: str, default_limit: int, default_output_format: str = "both") -> ParsedSearchCommand:
     tokens = shlex.split(message_text)
     theme_name: Optional[str] = None
     if len(tokens) >= 2 and not tokens[1].startswith("--"):
@@ -486,7 +637,7 @@ def _parse_search_command(message_text: str, default_limit: int) -> ParsedSearch
     date_from: Optional[datetime] = None
     date_to: Optional[datetime] = None
     limit: Optional[int] = default_limit
-    output_format = "both"
+    output_format = default_output_format
     deep_comments = False
     no_limit_tokens = {
         "0",
@@ -552,6 +703,126 @@ def _parse_search_command(message_text: str, default_limit: int) -> ParsedSearch
         limit=limit,
         output_format=output_format,
         deep_comments=deep_comments,
+    )
+
+
+async def _get_user_settings(user_id: int) -> UserSettingsDTO:
+    _, database, _, _ = _require_services()
+    return await database.get_user_settings(user_id, DEFAULT_WATCH_INTERVAL_MINUTES)
+
+
+def _settings_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔔 Подписки", callback_data="settings:watch"),
+                InlineKeyboardButton(text="🔍 Поиск", callback_data="settings:search"),
+            ],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
+        ]
+    )
+
+
+def _settings_search_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Формат выгрузки", callback_data="settings:search:format")],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_settings"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+            ],
+        ]
+    )
+
+
+def _settings_watch_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📄 Формат выгрузки", callback_data="settings:watch:format"),
+                InlineKeyboardButton(text="🕒 Период проверки", callback_data="settings:watch:period"),
+            ],
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_settings"),
+                InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+            ],
+        ]
+    )
+
+
+def _settings_format_picker_keyboard(scope: str, current_format: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for value in ("both", "text", "csv"):
+        label = SEARCH_FORMAT_LABELS[value]
+        if value == current_format:
+            label = f"✅ {label}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"settings:{scope}:fmt:{value}")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=f"settings:{scope}"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _settings_watch_period_keyboard(current_interval: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    chunk: list[InlineKeyboardButton] = []
+    seen: set[int] = set()
+    for minutes in (current_interval, *WATCH_INTERVAL_OPTIONS):
+        if minutes in seen:
+            continue
+        seen.add(minutes)
+        label = f"{minutes} мин"
+        if minutes == current_interval:
+            label = f"✅ {label}"
+        chunk.append(InlineKeyboardButton(text=label, callback_data=f"settings:watch:period:set:{minutes}"))
+        if len(chunk) == 3:
+            rows.append(chunk)
+            chunk = []
+    if chunk:
+        rows.append(chunk)
+    rows.append([InlineKeyboardButton(text="✍️ Свой период", callback_data="settings:watch:period:custom")])
+    rows.append(
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="settings:watch"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_output_format_value(output_format: str) -> str:
+    return SEARCH_FORMAT_LABELS.get(output_format, output_format)
+
+
+def _format_watch_interval_value(interval_minutes: int) -> str:
+    return f"{interval_minutes} мин"
+
+
+def _settings_root_text() -> str:
+    return (
+        "⚙️ Общие настройки\n\n"
+        "Здесь задаются значения по умолчанию для поиска и автопроверки.\n"
+        "После сохранения бот будет использовать их автоматически."
+    )
+
+
+def _settings_search_text(user_settings: UserSettingsDTO) -> str:
+    return (
+        "🔍 Настройки поиска\n\n"
+        f"📄 Формат выгрузки: {_format_output_format_value(user_settings.search_output_format)}\n\n"
+        "Этот формат будет использоваться во всех новых поисках."
+    )
+
+
+def _settings_watch_text(user_settings: UserSettingsDTO) -> str:
+    return (
+        "🔔 Настройки подписок\n\n"
+        f"📄 Формат выгрузки: {_format_output_format_value(user_settings.watch_output_format)}\n"
+        f"🕒 Период проверки: {_format_watch_interval_value(user_settings.watch_interval_minutes)}\n\n"
+        "Эти значения используются для новых и уже активных автопроверок."
     )
 
 
@@ -675,6 +946,23 @@ def _format_search_start_text(
     )
 
 
+def _format_auth_status_text(status: str, fallback: str) -> str:
+    if status == "authorized":
+        return "✅ Авторизация успешно завершена."
+    if status == "missing":
+        return "Нет активной авторизации. Нажмите «👤 Авторизация»."
+    if status == "expired":
+        return "⌛ QR-код истёк. Нажмите «🔄 Обновить QR»."
+    if status == "pending":
+        return (
+            "QR ещё не подтвержден.\n\n"
+            "1. Отсканируйте код в Telegram.\n"
+            "2. Нажмите «✅ Отсканировал».\n"
+            "3. Если потребуется пароль 2FA, бот попросит его автоматически."
+        )
+    return fallback
+
+
 def _validate_watch_interval(interval_minutes: int) -> None:
     if interval_minutes < MIN_WATCH_INTERVAL_MINUTES or interval_minutes > MAX_WATCH_INTERVAL_MINUTES:
         raise ValueError(
@@ -713,11 +1001,11 @@ def _watch_usage_text() -> str:
         "1. Откройте раздел «Подписки».\n"
         "2. Нажмите «Включить».\n"
         "3. Выберите тему.\n"
-        "4. Укажите интервал проверки или нажмите «Свой период».\n\n"
+        "4. Бот включит автопроверку с параметрами из «⚙️ Общие настройки».\n\n"
         "Что ещё можно сделать:\n"
         "• посмотреть активные подписки\n"
         "• отключить ненужную подписку\n"
-        "• изменить период проверки\n\n"
+        "• поменять формат выгрузки и период проверки в «⚙️ Общие настройки»\n\n"
         f"⏱ Доступный интервал: от {MIN_WATCH_INTERVAL_MINUTES} до {MAX_WATCH_INTERVAL_MINUTES} минут."
     )
 
@@ -729,7 +1017,8 @@ def _render_watch_list_text(watches: list[ThemeWatchDTO]) -> str:
             "Чтобы бот сам проверял новые сообщения:\n"
             "• откройте раздел «Подписки»\n"
             "• нажмите «Включить»\n"
-            "• выберите тему и период проверки"
+            "• выберите тему\n"
+            "Период и формат настраиваются в «⚙️ Общие настройки»."
         )
 
     lines = ["🔔 Активные подписки:"]
@@ -991,33 +1280,83 @@ def _theme_wizard_chats_prompt(theme_name: str) -> str:
     )
 
 
+async def _build_theme_status_map(themes: list[ThemeDTO], user_id: int) -> dict[int, tuple[str, str]]:
+    _, database, _, _ = _require_services()
+    watches = await database.list_theme_watches(user_id)
+    latest_runs = await database.get_latest_search_run_statuses(user_id)
+    watched_names = {item.theme_name.casefold() for item in watches}
+    active_names = active_search_themes_by_user.get(user_id, set())
+    all_active = ACTIVE_SEARCH_ALL_MARKER in active_names
+
+    result: dict[int, tuple[str, str]] = {}
+    for theme in themes:
+        key = theme.name.casefold()
+        latest_status = latest_runs.get(key)
+        if all_active or key in active_names or latest_status == "running":
+            result[theme.id] = ("⏳", "поиск в процессе")
+        elif key in watched_names:
+            result[theme.id] = ("🔔", "отслеживается")
+        elif latest_status == "completed":
+            result[theme.id] = ("🎯", "поиск завершен")
+        else:
+            result[theme.id] = ("•", "без статуса")
+    return result
+
+
+def _render_value_list(items: list[str], *, max_items: int = 200) -> str:
+    if not items:
+        return "(нет)"
+    lines: list[str] = []
+    for idx, value in enumerate(items[:max_items], start=1):
+        lines.append(f"{idx}. {_short_text(value, max_len=140)}")
+    if len(items) > max_items:
+        lines.append(f"... и еще {len(items) - max_items}")
+    return "\n".join(lines)
+
+
 async def _send_themes_panel(message: Message, user_id: int) -> None:
     summary = await _build_themes_panel_text(user_id)
-    await _send_watch_ui_message(message, user_id, summary, _themes_menu_keyboard())
+    await _send_watch_ui_message(
+        message,
+        user_id,
+        summary,
+        await _themes_panel_markup_for_user(user_id),
+    )
+
+
+async def _themes_panel_markup_for_user(user_id: int) -> InlineKeyboardMarkup:
+    _, database, _, _ = _require_services()
+    themes = await database.list_themes(user_id)
+    if not themes:
+        return _themes_menu_keyboard()
+    status_map = await _build_theme_status_map(themes, user_id)
+    status_labels = {theme.id: f"{status_map[theme.id][0]} {theme.name}" for theme in themes if theme.id in status_map}
+    return _themes_panel_keyboard(themes, active_theme_by_user.get(user_id), status_labels)
 
 
 async def _build_themes_panel_text(user_id: int) -> str:
     _, database, _, _ = _require_services()
     themes = await database.list_themes(user_id)
-    current = active_theme_by_user.get(user_id)
-    if current:
-        current_theme = await database.get_theme(user_id, current)
-        if current_theme is None:
-            active_theme_by_user.pop(user_id, None)
-            current = None
     if not themes:
         return (
-            "Тем пока нет.\n\n"
-            "Быстрый старт:\n"
-            "1) Откройте 'Создать и добавить'\n"
-            "2) Создайте тему\n"
-            "3) В действии 'Добавить чаты' можно добавить чаты вручную или кнопкой 'Добавить ВСЕ чаты аккаунта'\n"
-            "4) Добавьте ключевые слова"
+            "☰ Темы\n\n"
+            "Тем пока нет.\n"
+            "Нажмите «➕ Добавить тему», чтобы создать первую тему."
         )
-    return (
-        f"Темы: {len(themes)}\n"
-        f"Активная: {current or '(не выбрана)'}"
-    )
+    status_map = await _build_theme_status_map(themes, user_id)
+    lines = [
+        "☰ Темы",
+        "",
+        "Все темы:",
+    ]
+    for theme in themes:
+        icon, status_text = status_map.get(theme.id, ("•", "без статуса"))
+        lines.append(
+            f"{icon} {theme.name}  |  {status_text}  |  ключи: {len(theme.keywords)}  |  чаты: {len(theme.chats)}"
+        )
+    lines.append("")
+    lines.append("Выберите тему кнопкой ниже или создайте новую.")
+    return "\n".join(lines)
 
 
 async def _get_active_theme_for_user(user_id: int) -> Optional[ThemeDTO]:
@@ -1044,15 +1383,34 @@ def _render_themes_compact_list(themes: list[ThemeDTO]) -> str:
     return "\n".join(lines)
 
 
+def _format_theme_card(theme: ThemeDTO, *, status_icon: str, status_text: str) -> str:
+    return (
+        f"☰ Тема: {theme.name}\n"
+        f"Статус: {status_icon} {status_text}\n"
+        f"Ключевых слов: {len(theme.keywords)}\n"
+        f"Чатов: {len(theme.chats)}\n\n"
+        "Выберите действие:"
+    )
+
+
 def _render_chat_list(items: list[str], *, max_items: int = 200) -> str:
-    if not items:
-        return "(нет)"
-    lines: list[str] = []
-    for idx, value in enumerate(items[:max_items], start=1):
-        lines.append(f"{idx}. {_short_text(value, max_len=140)}")
-    if len(items) > max_items:
-        lines.append(f"... и еще {len(items) - max_items}")
-    return "\n".join(lines)
+    return _render_value_list(items, max_items=max_items)
+
+
+def _format_theme_keywords_screen(theme: ThemeDTO) -> str:
+    return (
+        f"🔑 Ключевые слова темы '{theme.name}'\n"
+        f"Всего: {len(theme.keywords)}\n\n"
+        f"{_render_value_list(theme.keywords)}"
+    )
+
+
+def _format_theme_chats_screen(theme: ThemeDTO) -> str:
+    return (
+        f"💬 Чаты темы '{theme.name}'\n"
+        f"Всего: {len(theme.chats)}\n\n"
+        f"{_render_value_list(theme.chats)}"
+    )
 
 
 async def _build_search_chats_text(user_id: int) -> str:
@@ -1139,18 +1497,18 @@ def _search_error_ui(theme: Optional[ThemeDTO], error_text: str) -> tuple[str, O
                 "Выберите действие:",
                 InlineKeyboardMarkup(
                     inline_keyboard=[
-                        [InlineKeyboardButton(text="Добавить чаты в тему", callback_data=f"themes:do:ac:{theme.id}")],
+                        [InlineKeyboardButton(text="Открыть чаты темы", callback_data=f"themes:chats:{theme.id}")],
                         [InlineKeyboardButton(text="Открыть Темы", callback_data="menu_themes")],
                     ]
                 ),
             )
         return (
             "Поиск пока невозможен: в выбранном наборе нет чатов.\n\n"
-            "Добавьте чаты в темы и запустите поиск снова.",
+            "Откройте темы и добавьте чаты, затем запустите поиск снова.",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="Добавить чаты", callback_data="themes:quick:ac")],
-                    [InlineKeyboardButton(text="Открыть Темы", callback_data="menu_themes")],
+                    [InlineKeyboardButton(text="☰ Открыть темы", callback_data="menu_themes")],
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
                 ]
             ),
         )
@@ -1158,11 +1516,11 @@ def _search_error_ui(theme: Optional[ThemeDTO], error_text: str) -> tuple[str, O
     if "во всех темах пуст список чатов" in lowered:
         return (
             "Поиск по всем чатам пока невозможен: во всех темах нет чатов.\n\n"
-            "Добавьте чаты в темы и запустите поиск снова.",
+            "Откройте темы и добавьте чаты, затем запустите поиск снова.",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="Добавить чаты", callback_data="themes:quick:ac")],
-                    [InlineKeyboardButton(text="Открыть Темы", callback_data="menu_themes")],
+                    [InlineKeyboardButton(text="☰ Открыть темы", callback_data="menu_themes")],
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
                 ]
             ),
         )
@@ -1174,17 +1532,18 @@ def _search_error_ui(theme: Optional[ThemeDTO], error_text: str) -> tuple[str, O
                 "Выберите действие:",
                 InlineKeyboardMarkup(
                     inline_keyboard=[
-                        [InlineKeyboardButton(text="Добавить ключевые слова", callback_data=f"themes:do:ak:{theme.id}")],
+                        [InlineKeyboardButton(text="Открыть ключи темы", callback_data=f"themes:keys:{theme.id}")],
                         [InlineKeyboardButton(text="Открыть Темы", callback_data="menu_themes")],
                     ]
                 ),
             )
         return (
-            "Поиск пока невозможен: не заданы ключевые слова.",
+            "Поиск пока невозможен: не заданы ключевые слова.\n\n"
+            "Откройте темы и добавьте ключевые слова.",
             InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="Добавить ключевые слова", callback_data="themes:quick:ak")],
-                    [InlineKeyboardButton(text="Открыть Темы", callback_data="menu_themes")],
+                    [InlineKeyboardButton(text="☰ Открыть темы", callback_data="menu_themes")],
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")],
                 ]
             ),
         )
@@ -1314,6 +1673,7 @@ async def _create_ui_search_task(
         if theme is None:
             raise ValueError("Тема не найдена.")
         active_theme_by_user[user_id] = theme.name
+        _set_active_search_themes(user_id, [theme.name])
         text = _format_search_start_text(
             f"Тема '{theme.name}'",
             output_format,
@@ -1337,6 +1697,7 @@ async def _create_ui_search_task(
         )
         return text, task
 
+    _set_active_search_themes(user_id, all_themes=True)
     text = _format_search_start_text(
         "Все чаты из всех тем",
         output_format,
@@ -1420,6 +1781,7 @@ async def _run_search_with_theme(
         task = active_search_tasks.get(user_id)
         if task is asyncio.current_task():
             active_search_tasks.pop(user_id, None)
+        _clear_active_search_themes(user_id)
 
 
 def _watch_window_start(last_checked_at: Optional[datetime]) -> Optional[datetime]:
@@ -1437,6 +1799,7 @@ async def _notify_watch_hits(
     date_to: datetime,
     items,
     csv_path,
+    output_format: str,
 ) -> None:
     range_from = _format_dt_utc(date_from) if date_from else "начало истории"
     header = (
@@ -1447,13 +1810,15 @@ async def _notify_watch_hits(
 
     try:
         await bot.send_message(watch.chat_id, header, disable_web_page_preview=True)
-        for chunk in _render_results_messages(theme_name, items):
-            await bot.send_message(watch.chat_id, chunk, disable_web_page_preview=True)
-        await bot.send_document(
-            watch.chat_id,
-            FSInputFile(path=str(csv_path), filename=csv_path.name),
-            caption=f"CSV автопроверки по теме '{theme_name}', найдено: {len(items)}",
-        )
+        if output_format in {"both", "text"}:
+            for chunk in _render_results_messages(theme_name, items):
+                await bot.send_message(watch.chat_id, chunk, disable_web_page_preview=True)
+        if output_format in {"both", "csv"}:
+            await bot.send_document(
+                watch.chat_id,
+                FSInputFile(path=str(csv_path), filename=csv_path.name),
+                caption=f"CSV автопроверки по теме '{theme_name}', найдено: {len(items)}",
+            )
     except Exception as notify_error:
         logger.warning(
             "Failed to send watch notification user_id=%s theme=%s: %s",
@@ -1465,6 +1830,7 @@ async def _notify_watch_hits(
 
 async def _run_theme_watch_check(bot: Bot, watch: ThemeWatchDTO) -> None:
     app_settings, database, auth, search = _require_services()
+    user_settings = await _get_user_settings(watch.user_id)
     current_task = active_search_tasks.get(watch.user_id)
     if current_task and current_task.done():
         if active_search_tasks.get(watch.user_id) is current_task:
@@ -1537,6 +1903,7 @@ async def _run_theme_watch_check(bot: Bot, watch: ThemeWatchDTO) -> None:
             date_to=date_to,
             items=items,
             csv_path=csv_path,
+            output_format=user_settings.watch_output_format,
         )
     except asyncio.CancelledError:
         raise
@@ -1584,9 +1951,9 @@ async def cmd_start(message: Message) -> None:
         )
     else:
         steps = (
-            "• нажмите 'Авторизация' и пройдите вход\n"
-            "• затем откройте 'Темы' и создайте тему\n"
-            "• после этого используйте 'Поиск' или 'Подписки'"
+            "• нажмите «👤 Авторизация» и отсканируйте QR\n"
+            "• если включена 2FA, бот попросит пароль\n"
+            "• если нужна инструкция, нажмите «❓ Помощь»"
         )
 
     await _send_watch_ui_message(
@@ -1604,34 +1971,42 @@ async def cmd_start(message: Message) -> None:
 
 def _help_text() -> str:
     return (
-        "Как пользоваться ботом:\n"
-        "1) Сначала пройдите авторизацию через QR-код.\n"
-        "2) Откройте раздел 'Темы' и создайте тему.\n"
-        "3) Добавьте ключевые слова и чаты для поиска.\n"
-        "4) Перейдите в раздел 'Поиск': выберите тему (или все чаты), формат, лимит, период дат и режим комментариев.\n"
-        "5) Бот пришлет найденные сообщения и файл CSV.\n\n"
-        "В разделе 'Темы' -> 'Создать и добавить' в действии 'Добавить чаты' есть кнопка 'Добавить ВСЕ чаты аккаунта'.\n"
-        "Если у канала есть обсуждение постов, комментарии к постам тоже ищутся автоматически.\n"
-        "Режим 'Глубокий' в поиске проверяет комментарии тщательнее, но работает медленнее.\n"
-        "В разделе 'Подписки' можно включить регулярную автопроверку: бот будет сам присылать новые совпадения.\n\n"
-        "Подсказки:\n"
-        "- Чаты можно задавать как @username, id, точное название или ссылку t.me.\n"
-        "- Если результатов слишком много, уменьшайте период дат или ставьте лимит.\n"
-        "- Если ничего не найдено, проверьте ключевые слова и список чатов."
+        "❓ Помощь\n\n"
+        "1. Авторизуйтесь через QR-код.\n"
+        "2. Откройте раздел «Темы» и создайте тему.\n"
+        "3. Добавьте ключевые слова и чаты.\n"
+        "4. Запустите разовый поиск или включите отслеживание.\n\n"
+        "Полезно знать:\n"
+        "• чаты можно указывать как @username, id, точное имя или ссылку t.me\n"
+        "• комментарии к постам ищутся автоматически, если они доступны\n"
+        "• параметры поиска и подписок по умолчанию задаются в «⚙️ Общие настройки»"
     )
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     user_id = await _ensure_user(message)
-    await _send_watch_ui_message(message, user_id, _help_text(), await _main_menu_for_user(user_id))
+    await _send_watch_ui_message(message, user_id, _help_text(), _help_keyboard())
 
 
 @router.callback_query(F.data == "menu_home")
-async def cb_home(callback: CallbackQuery) -> None:
+async def cb_home(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message and callback.from_user:
+        await state.clear()
         user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-        await _edit_or_replace_watch_ui(callback, user_id, "Главное меню:", await _main_menu_for_user(user_id))
+        current = callback.message
+        tracked = watch_ui_message_by_user.get(user_id)
+        current_ref = (current.chat.id, current.message_id)
+        main_menu = await _main_menu_for_user(user_id)
+        if tracked == current_ref:
+            await _edit_or_replace_watch_ui(callback, user_id, "Главное меню:", main_menu)
+        else:
+            await _ensure_nav_keyboard(current, user_id)
+            await _cleanup_previous_watch_ui_message(current.bot, user_id, current.chat.id)
+            sent = await current.answer("Главное меню:", reply_markup=main_menu, disable_web_page_preview=True)
+            _remember_watch_ui_message(user_id, sent)
+            with suppress(TelegramBadRequest, TelegramNotFound):
+                await current.delete()
     await callback.answer()
 
 
@@ -1639,8 +2014,186 @@ async def cb_home(callback: CallbackQuery) -> None:
 async def cb_help(callback: CallbackQuery) -> None:
     if callback.message and callback.from_user:
         user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-        await _edit_or_replace_watch_ui(callback, user_id, _help_text(), await _main_menu_for_user(user_id))
+        await _edit_or_replace_watch_ui(callback, user_id, _help_text(), _help_keyboard())
     await callback.answer()
+
+
+@router.callback_query(F.data == "menu_settings")
+async def cb_settings(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message and callback.from_user:
+        await _clear_settings_state_if_needed(state)
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        await _edit_or_replace_watch_ui(callback, user_id, _settings_root_text(), _settings_menu_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings:search")
+async def cb_settings_search(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message and callback.from_user:
+        await _clear_settings_state_if_needed(state)
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user_settings = await _get_user_settings(user_id)
+        await _edit_or_replace_watch_ui(callback, user_id, _settings_search_text(user_settings), _settings_search_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings:watch")
+async def cb_settings_watch(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message and callback.from_user:
+        await _clear_settings_state_if_needed(state)
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user_settings = await _get_user_settings(user_id)
+        await _edit_or_replace_watch_ui(callback, user_id, _settings_watch_text(user_settings), _settings_watch_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings:search:format")
+async def cb_settings_search_format(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message and callback.from_user:
+        await _clear_settings_state_if_needed(state)
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user_settings = await _get_user_settings(user_id)
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            "🔍 Настройки поиска\n\nВыберите формат выгрузки по умолчанию:",
+            _settings_format_picker_keyboard("search", user_settings.search_output_format),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "settings:watch:format")
+async def cb_settings_watch_format(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message and callback.from_user:
+        await _clear_settings_state_if_needed(state)
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user_settings = await _get_user_settings(user_id)
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            "🔔 Настройки подписок\n\nВыберите формат выгрузки по умолчанию:",
+            _settings_format_picker_keyboard("watch", user_settings.watch_output_format),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settings:search:fmt:"))
+async def cb_settings_search_format_save(callback: CallbackQuery) -> None:
+    if callback.message and callback.from_user:
+        _, database, _, _ = _require_services()
+        output_format = (callback.data or "").split(":")[-1]
+        if output_format not in SEARCH_FORMAT_LABELS:
+            await callback.answer("Некорректный формат", show_alert=False)
+            return
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user_settings = await database.set_search_output_format(user_id, output_format, DEFAULT_WATCH_INTERVAL_MINUTES)
+        await _edit_or_replace_watch_ui(callback, user_id, _settings_search_text(user_settings), _settings_search_keyboard())
+    await callback.answer("Сохранено")
+
+
+@router.callback_query(F.data.startswith("settings:watch:fmt:"))
+async def cb_settings_watch_format_save(callback: CallbackQuery) -> None:
+    if callback.message and callback.from_user:
+        _, database, _, _ = _require_services()
+        output_format = (callback.data or "").split(":")[-1]
+        if output_format not in SEARCH_FORMAT_LABELS:
+            await callback.answer("Некорректный формат", show_alert=False)
+            return
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user_settings = await database.set_watch_output_format(user_id, output_format, DEFAULT_WATCH_INTERVAL_MINUTES)
+        await _edit_or_replace_watch_ui(callback, user_id, _settings_watch_text(user_settings), _settings_watch_keyboard())
+    await callback.answer("Сохранено")
+
+
+@router.callback_query(F.data == "settings:watch:period")
+async def cb_settings_watch_period(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message and callback.from_user:
+        await _clear_settings_state_if_needed(state)
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user_settings = await _get_user_settings(user_id)
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            (
+                "🔔 Настройки подписок\n\n"
+                f"Текущий период: {_format_watch_interval_value(user_settings.watch_interval_minutes)}\n\n"
+                "Выберите период проверки по умолчанию:"
+            ),
+            _settings_watch_period_keyboard(user_settings.watch_interval_minutes),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settings:watch:period:set:"))
+async def cb_settings_watch_period_save(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+    raw = (callback.data or "").split(":")[-1]
+    try:
+        interval_minutes = int(raw)
+        _validate_watch_interval(interval_minutes)
+    except ValueError:
+        await callback.answer("Некорректный интервал", show_alert=False)
+        return
+
+    _, database, _, _ = _require_services()
+    await state.clear()
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    user_settings = await database.set_watch_interval_minutes(user_id, interval_minutes, DEFAULT_WATCH_INTERVAL_MINUTES)
+    await database.update_all_theme_watches_interval(user_id, interval_minutes)
+    await _edit_or_replace_watch_ui(callback, user_id, _settings_watch_text(user_settings), _settings_watch_keyboard())
+    await callback.answer("Сохранено")
+
+
+@router.callback_query(F.data == "settings:watch:period:custom")
+async def cb_settings_watch_period_custom(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.message and callback.from_user:
+        user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        await state.set_state(SettingsUiStates.waiting_watch_interval)
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            (
+                "🔔 Настройки подписок\n\n"
+                f"Введите период проверки в минутах.\n"
+                f"Диапазон: {MIN_WATCH_INTERVAL_MINUTES}..{MAX_WATCH_INTERVAL_MINUTES}\n"
+                "Пример: 45\n"
+                "Для отмены: /cancel"
+            ),
+            _settings_watch_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(SettingsUiStates.waiting_watch_interval, F.text, ~F.text.startswith("/"))
+async def st_settings_watch_interval(message: Message, state: FSMContext) -> None:
+    user_id = await _ensure_user(message)
+    raw = (message.text or "").strip()
+    if not raw:
+        await _send_watch_ui_message(message, user_id, "Введите число минут.", _settings_watch_keyboard())
+        return
+    if not raw.isdigit():
+        await _send_watch_ui_message(
+            message,
+            user_id,
+            "Период должен быть целым числом минут. Пример: 45",
+            _settings_watch_keyboard(),
+        )
+        return
+
+    interval_minutes = int(raw)
+    try:
+        _validate_watch_interval(interval_minutes)
+    except ValueError as e:
+        await _send_watch_ui_message(message, user_id, str(e), _settings_watch_keyboard())
+        return
+
+    _, database, _, _ = _require_services()
+    user_settings = await database.set_watch_interval_minutes(user_id, interval_minutes, DEFAULT_WATCH_INTERVAL_MINUTES)
+    await database.update_all_theme_watches_interval(user_id, interval_minutes)
+    await state.clear()
+    await _send_watch_ui_message(message, user_id, _settings_watch_text(user_settings), _settings_watch_keyboard())
 
 
 @router.message(StateFilter(None), F.text == "Главное меню")
@@ -1652,7 +2205,7 @@ async def kb_home(message: Message) -> None:
 @router.message(StateFilter(None), F.text == "Помощь")
 async def kb_help(message: Message) -> None:
     user_id = await _ensure_user(message)
-    await _send_watch_ui_message(message, user_id, _help_text(), await _main_menu_for_user(user_id))
+    await _send_watch_ui_message(message, user_id, _help_text(), _help_keyboard())
 
 
 @router.message(StateFilter(None), F.text == "Темы")
@@ -1674,14 +2227,17 @@ async def kb_search(message: Message) -> None:
     if not await auth.is_authorized(user_id):
         await _send_watch_ui_message(message, user_id, "Сначала авторизуйте аккаунт через /auth.", await _main_menu_for_user(user_id))
         return
+    user_settings = await _get_user_settings(user_id)
     await _send_watch_ui_message(
         message,
         user_id,
-        "Быстрый поиск кнопками:\n"
-        "1) Выберите тему или 'Все чаты'\n"
-        "2) Выберите формат результата\n"
-        "3) Выберите лимит\n"
-        "4) Выберите период поиска.",
+        "🔍 Быстрый поиск\n\n"
+        f"📄 Формат по умолчанию: {_format_output_format_value(user_settings.search_output_format)}\n\n"
+        "Дальше бот попросит выбрать:\n"
+        "• тему или все чаты\n"
+        "• лимит\n"
+        "• период\n"
+        "• режим комментариев",
         _search_menu_keyboard(),
     )
 
@@ -1774,10 +2330,15 @@ async def cb_watch_set(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
         return
 
+    user_settings = await _get_user_settings(user_id)
     await _edit_or_replace_watch_ui(
         callback,
         user_id,
-        "Выберите тему для автопроверки:",
+        (
+            "Выберите тему для автопроверки.\n"
+            f"Период: {_format_watch_interval_value(user_settings.watch_interval_minutes)}\n"
+            f"Формат: {_format_output_format_value(user_settings.watch_output_format)}"
+        ),
         _watch_theme_picker_keyboard(themes, mode="set"),
     )
     await callback.answer()
@@ -1812,18 +2373,28 @@ async def cb_watch_set_pick_theme(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
+    user_settings = await _get_user_settings(user_id)
     active_theme_by_user[user_id] = theme.name
+    watch = await database.set_theme_watch(
+        user_id=user_id,
+        theme_name=theme.name,
+        chat_id=callback.message.chat.id,
+        interval_minutes=user_settings.watch_interval_minutes,
+    )
+    panel_text = await _build_watch_panel_text(user_id)
     await _edit_or_replace_watch_ui(
         callback,
         user_id,
         (
-            f"Тема: {theme.name}\n"
-            "Выберите период проверки кнопкой ниже.\n"
-            "Если нужен нестандартный интервал, нажмите кнопку 'Свой период'."
+            f"Автопроверка включена для темы '{watch.theme_name}'.\n"
+            f"⏱ Период: {_format_watch_interval_value(watch.interval_minutes)}\n"
+            f"📄 Формат: {_format_output_format_value(user_settings.watch_output_format)}\n"
+            f"⏭ Следующая проверка: {_format_dt_utc(watch.next_check_at)}\n\n"
+            f"{panel_text}"
         ),
-        _watch_interval_keyboard(theme.id),
+        _watch_menu_keyboard(),
     )
-    await callback.answer()
+    await callback.answer("Сохранено")
 
 
 @router.callback_query(F.data.startswith("watch:set:custom:"))
@@ -1831,55 +2402,19 @@ async def cb_watch_set_custom_interval(callback: CallbackQuery, state: FSMContex
     if not callback.message or not callback.from_user:
         await callback.answer()
         return
-
-    parts = (callback.data or "").split(":")
-    if len(parts) != 4:
-        await callback.answer("Некорректные данные", show_alert=False)
-        return
-    try:
-        theme_id = int(parts[3])
-    except ValueError:
-        await callback.answer("Некорректная тема", show_alert=False)
-        return
-
-    _, database, auth, _ = _require_services()
+    await state.clear()
     user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    if not await auth.is_authorized(user_id):
-        await _edit_or_replace_watch_ui(
-            callback,
-            user_id,
-            "Сначала авторизуйте аккаунт через /auth.",
-            _watch_menu_keyboard(),
-        )
-        await callback.answer()
-        return
-
-    theme = await database.get_theme_by_id(user_id, theme_id)
-    if theme is None:
-        await _edit_or_replace_watch_ui(
-            callback,
-            user_id,
-            "Тема не найдена или уже удалена.",
-            _watch_menu_keyboard(),
-        )
-        await callback.answer()
-        return
-
-    active_theme_by_user[user_id] = theme.name
-    await state.set_state(WatchUiStates.waiting_custom_interval)
-    await state.update_data(watch_theme_id=theme.id)
+    user_settings = await _get_user_settings(user_id)
     await _edit_or_replace_watch_ui(
         callback,
         user_id,
         (
-            f"Тема: {theme.name}\n"
-            f"Введите период проверки в минутах (от {MIN_WATCH_INTERVAL_MINUTES} до {MAX_WATCH_INTERVAL_MINUTES}).\n"
-            "Пример: 45\n"
-            "Для отмены: /cancel"
+            "Старая форма выбора периода больше не используется.\n\n"
+            f"{_settings_watch_text(user_settings)}"
         ),
-        _watch_menu_keyboard(),
+        _settings_watch_keyboard(),
     )
-    await callback.answer()
+    await callback.answer("Открыты актуальные настройки")
 
 
 @router.callback_query(F.data.startswith("watch:set:int:"))
@@ -1887,65 +2422,19 @@ async def cb_watch_set_interval(callback: CallbackQuery, state: FSMContext) -> N
     if not callback.message or not callback.from_user:
         await callback.answer()
         return
-
-    parts = (callback.data or "").split(":")
-    if len(parts) != 5:
-        await callback.answer("Некорректные данные", show_alert=False)
-        return
-    try:
-        theme_id = int(parts[3])
-        interval_minutes = int(parts[4])
-        _validate_watch_interval(interval_minutes)
-    except ValueError:
-        await callback.answer("Некорректный интервал", show_alert=False)
-        return
-
-    _, database, auth, _ = _require_services()
-    current_state = await state.get_state()
-    if current_state and current_state.startswith(f"{WatchUiStates.__name__}:"):
-        await state.clear()
+    await state.clear()
     user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    if not await auth.is_authorized(user_id):
-        await _edit_or_replace_watch_ui(
-            callback,
-            user_id,
-            "Сначала авторизуйте аккаунт через /auth.",
-            _watch_menu_keyboard(),
-        )
-        await callback.answer()
-        return
-
-    theme = await database.get_theme_by_id(user_id, theme_id)
-    if theme is None:
-        await _edit_or_replace_watch_ui(
-            callback,
-            user_id,
-            "Тема не найдена или уже удалена.",
-            _watch_menu_keyboard(),
-        )
-        await callback.answer()
-        return
-
-    watch = await database.set_theme_watch(
-        user_id=user_id,
-        theme_name=theme.name,
-        chat_id=callback.message.chat.id,
-        interval_minutes=interval_minutes,
-    )
-    active_theme_by_user[user_id] = theme.name
-    panel_text = await _build_watch_panel_text(user_id)
+    user_settings = await _get_user_settings(user_id)
     await _edit_or_replace_watch_ui(
         callback,
         user_id,
         (
-            f"Автопроверка включена для темы '{watch.theme_name}'.\n"
-            f"Интервал: {watch.interval_minutes} мин.\n"
-            f"Следующая проверка: {_format_dt_utc(watch.next_check_at)}\n\n"
-            f"{panel_text}"
+            "Старая форма выбора периода больше не используется.\n\n"
+            f"{_settings_watch_text(user_settings)}"
         ),
-        _watch_menu_keyboard(),
+        _settings_watch_keyboard(),
     )
-    await callback.answer("Сохранено")
+    await callback.answer("Открыты актуальные настройки")
 
 
 @router.message(WatchUiStates.waiting_custom_interval, F.text, ~F.text.startswith("/"))
@@ -2117,7 +2606,7 @@ async def _send_qr(
         await _send_watch_ui_message(
             message,
             user_id,
-            status.message,
+            _format_auth_status_text(status.status, status.message),
             _main_menu(show_auth_actions=False),
             nav_show_auth_actions=False,
         )
@@ -2126,7 +2615,7 @@ async def _send_qr(
         await _send_watch_ui_message(
             message,
             user_id,
-            status.message,
+            _format_auth_status_text(status.status, status.message),
             _auth_actions_menu(),
             nav_show_auth_actions=True,
         )
@@ -2138,8 +2627,8 @@ async def _send_qr(
         photo=BufferedInputFile(status.qr_png, filename="qr.png"),
         caption=(
             f"{status.message}\n\n"
-            "После сканирования нажмите 'Проверить QR'.\n"
-            "Если включена 2FA, бот попросит пароль."
+            "После сканирования нажмите «✅ Отсканировал».\n"
+            "Если включена 2FA, бот сразу попросит пароль."
         ),
         reply_markup=_auth_actions_menu(),
         nav_show_auth_actions=True,
@@ -2203,16 +2692,17 @@ async def _check_auth(
         await _send_watch_ui_message(
             message,
             user_id,
-            "Введите пароль 2FA следующим сообщением.",
-            _main_menu(show_auth_actions=True),
+            "🔐 На аккаунте включен пароль 2FA.\n\nВведите пароль следующим сообщением.",
+            _auth_actions_menu(),
             nav_show_auth_actions=True,
         )
         return
+    await state.clear()
     await _send_watch_ui_message(
         message,
         user_id,
-        result.message,
-        _main_menu(show_auth_actions=result.status != "authorized"),
+        _format_auth_status_text(result.status, result.message),
+        _main_menu(show_auth_actions=False) if result.status == "authorized" else _auth_actions_menu(),
         nav_show_auth_actions=result.status != "authorized",
     )
 
@@ -2242,7 +2732,7 @@ async def _open_2fa_prompt(
         await _send_watch_ui_message(
             message,
             user_id,
-            "Нет активной QR-авторизации. Сначала запустите /auth.",
+            "Нет активной авторизации. Нажмите «👤 Авторизация» и отсканируйте QR.",
             _main_menu(show_auth_actions=True),
             nav_show_auth_actions=True,
         )
@@ -2252,8 +2742,8 @@ async def _open_2fa_prompt(
     await _send_watch_ui_message(
         message,
         user_id,
-        "Отправьте пароль 2FA следующим сообщением. Для отмены: /cancel",
-        _main_menu(show_auth_actions=True),
+        "🔐 Отправьте пароль 2FA следующим сообщением.\nДля отмены: /cancel",
+        _auth_actions_menu(),
         nav_show_auth_actions=True,
     )
 
@@ -2287,19 +2777,6 @@ async def cb_auth_check(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.callback_query(F.data == "menu_auth_2fa")
-async def cb_auth_2fa(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.message and callback.from_user:
-        await _open_2fa_prompt(
-            callback.message,
-            state,
-            callback.from_user.id,
-            callback.from_user.username,
-            callback.from_user.first_name,
-        )
-    await callback.answer()
-
-
 @router.message(AuthStates.waiting_2fa)
 async def handle_2fa_password(message: Message, state: FSMContext) -> None:
     user_id = await _ensure_user(message)
@@ -2310,7 +2787,7 @@ async def handle_2fa_password(message: Message, state: FSMContext) -> None:
             message,
             user_id,
             "Пароль пуст. Попробуйте снова.",
-            _main_menu(show_auth_actions=True),
+            _auth_actions_menu(),
             nav_show_auth_actions=True,
         )
         return
@@ -2320,7 +2797,7 @@ async def handle_2fa_password(message: Message, state: FSMContext) -> None:
     await _send_watch_ui_message(
         message,
         user_id,
-        result.message,
+        _format_auth_status_text(result.status, result.message),
         _main_menu(show_auth_actions=result.status != "authorized"),
         nav_show_auth_actions=result.status != "authorized",
     )
@@ -2359,9 +2836,279 @@ async def cb_themes(callback: CallbackQuery) -> None:
     if callback.message and callback.from_user:
         user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
         text = await _build_themes_panel_text(user_id)
-        await _edit_or_replace_watch_ui(callback, user_id, text, _themes_menu_keyboard())
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            text,
+            await _themes_panel_markup_for_user(user_id),
+        )
     await callback.answer()
 
+
+@router.callback_query(F.data.startswith("themes:open:"))
+async def cb_themes_open(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Некорректные данные", show_alert=False)
+        return
+    try:
+        theme_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Некорректная тема", show_alert=False)
+        return
+
+    _, database, _, _ = _require_services()
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    theme = await database.get_theme_by_id(user_id, theme_id)
+    if theme is None:
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            "Тема не найдена или уже удалена.",
+            await _themes_panel_markup_for_user(user_id),
+        )
+        await callback.answer()
+        return
+
+    active_theme_by_user[user_id] = theme.name
+    status_map = await _build_theme_status_map([theme], user_id)
+    status_icon, status_text = status_map.get(theme.id, ("•", "без статуса"))
+    await _edit_or_replace_watch_ui(
+        callback,
+        user_id,
+        _format_theme_card(theme, status_icon=status_icon, status_text=status_text),
+        _theme_detail_keyboard(theme.id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^themes:keys:(add|del|clear):\d+$"))
+async def cb_theme_keys(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    parts = (callback.data or "").split(":")
+    if len(parts) < 3:
+        await callback.answer("Некорректные данные", show_alert=False)
+        return
+
+    action = parts[2]
+    if action not in {"add", "del", "clear"} or len(parts) != 4:
+        await callback.answer("Некорректное действие", show_alert=False)
+        return
+
+    try:
+        theme_id = int(parts[3])
+    except ValueError:
+        await callback.answer("Некорректная тема", show_alert=False)
+        return
+
+    _, database, _, _ = _require_services()
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    theme = await database.get_theme_by_id(user_id, theme_id)
+    if theme is None:
+        await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
+        await callback.answer()
+        return
+
+    active_theme_by_user[user_id] = theme.name
+    if action == "clear":
+        removed = await database.clear_keywords(user_id, theme.name)
+        theme = await database.get_theme_by_id(user_id, theme_id)
+        if theme is None:
+            await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
+            await callback.answer()
+            return
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            f"Ключевые слова очищены: {removed}.\n\n{_format_theme_keywords_screen(theme)}",
+            _theme_keywords_keyboard(theme_id),
+        )
+        await callback.answer("Готово")
+        return
+
+    await state.set_state(ThemeUiStates.waiting_bulk_payload)
+    await state.update_data(theme_ui_action="add_kw" if action == "add" else "del_kw", theme_name=theme.name)
+    await _edit_or_replace_watch_ui(callback, user_id, _theme_action_prompt("add_kw" if action == "add" else "del_kw", theme.name), _theme_keywords_keyboard(theme.id))
+    await callback.answer()
+
+@router.callback_query(F.data.regexp(r"^themes:chats:(add|del|clear):\d+$"))
+async def cb_theme_chats(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    parts = (callback.data or "").split(":")
+    if len(parts) < 3:
+        await callback.answer("Некорректные данные", show_alert=False)
+        return
+
+    action = parts[2]
+    if action not in {"add", "del", "clear"} or len(parts) != 4:
+        await callback.answer("Некорректное действие", show_alert=False)
+        return
+
+    try:
+        theme_id = int(parts[3])
+    except ValueError:
+        await callback.answer("Некорректная тема", show_alert=False)
+        return
+
+    _, database, _, _ = _require_services()
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    theme = await database.get_theme_by_id(user_id, theme_id)
+    if theme is None:
+        await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
+        await callback.answer()
+        return
+
+    active_theme_by_user[user_id] = theme.name
+    if action == "clear":
+        removed = await database.clear_chats(user_id, theme.name)
+        theme = await database.get_theme_by_id(user_id, theme_id)
+        if theme is None:
+            await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
+            await callback.answer()
+            return
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            f"Чаты очищены: {removed}.\n\n{_format_theme_chats_screen(theme)}",
+            _theme_chats_keyboard(theme_id),
+        )
+        await callback.answer("Готово")
+        return
+
+    await state.set_state(ThemeUiStates.waiting_bulk_payload)
+    await state.update_data(theme_ui_action="add_chat" if action == "add" else "del_chat", theme_name=theme.name)
+    markup = _theme_add_chat_keyboard(theme.id, back_callback=f"themes:chats:{theme.id}") if action == "add" else _theme_chats_keyboard(theme.id)
+    await _edit_or_replace_watch_ui(callback, user_id, _theme_action_prompt("add_chat" if action == "add" else "del_chat", theme.name), markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^themes:keys:\d+$"))
+async def cb_theme_keys_view(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    try:
+        theme_id = int((callback.data or "").split(":")[2])
+    except ValueError:
+        await callback.answer("Некорректная тема", show_alert=False)
+        return
+
+    _, database, _, _ = _require_services()
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    theme = await database.get_theme_by_id(user_id, theme_id)
+    if theme is None:
+        await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
+        await callback.answer()
+        return
+
+    active_theme_by_user[user_id] = theme.name
+    await _edit_or_replace_watch_ui(callback, user_id, _format_theme_keywords_screen(theme), _theme_keywords_keyboard(theme.id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^themes:chats:\d+$"))
+async def cb_theme_chats_view(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    try:
+        theme_id = int((callback.data or "").split(":")[2])
+    except ValueError:
+        await callback.answer("Некорректная тема", show_alert=False)
+        return
+
+    _, database, _, _ = _require_services()
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    theme = await database.get_theme_by_id(user_id, theme_id)
+    if theme is None:
+        await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
+        await callback.answer()
+        return
+
+    active_theme_by_user[user_id] = theme.name
+    await _edit_or_replace_watch_ui(callback, user_id, _format_theme_chats_screen(theme), _theme_chats_keyboard(theme.id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("themes:delete:ask:"))
+async def cb_theme_delete_ask(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    try:
+        theme_id = int((callback.data or "").split(":")[3])
+    except Exception:
+        await callback.answer("Некорректная тема", show_alert=False)
+        return
+
+    _, database, _, _ = _require_services()
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    theme = await database.get_theme_by_id(user_id, theme_id)
+    if theme is None:
+        await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
+        await callback.answer()
+        return
+
+    await _edit_or_replace_watch_ui(
+        callback,
+        user_id,
+        (
+            f"🗑️ Удаление темы '{theme.name}'\n\n"
+            "Будут удалены ключи, чаты и связанные подписки.\n"
+            "Подтвердите удаление."
+        ),
+        _theme_delete_confirm_keyboard(theme.id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("themes:delete:yes:"))
+async def cb_theme_delete_yes(callback: CallbackQuery) -> None:
+    if not callback.message or not callback.from_user:
+        await callback.answer()
+        return
+
+    try:
+        theme_id = int((callback.data or "").split(":")[3])
+    except Exception:
+        await callback.answer("Некорректная тема", show_alert=False)
+        return
+
+    _, database, _, _ = _require_services()
+    user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+    theme = await database.get_theme_by_id(user_id, theme_id)
+    if theme is None:
+        await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
+        await callback.answer()
+        return
+
+    ok = await database.delete_theme(user_id, theme.name)
+    if ok:
+        current = active_theme_by_user.get(user_id)
+        if current and current.casefold() == theme.name.casefold():
+            active_theme_by_user.pop(user_id, None)
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            f"Тема '{theme.name}' удалена.\n\n{await _build_themes_panel_text(user_id)}",
+            await _themes_panel_markup_for_user(user_id),
+        )
+    else:
+        await _edit_or_replace_watch_ui(callback, user_id, "Не удалось удалить тему.", _theme_delete_confirm_keyboard(theme.id))
+    await callback.answer("Готово")
 
 @router.callback_query(F.data == "themes:section:add")
 async def cb_themes_section_add(callback: CallbackQuery) -> None:
@@ -2370,12 +3117,8 @@ async def cb_themes_section_add(callback: CallbackQuery) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "✨ Раздел 1/3 — Создание и наполнение темы\n\n"
-            "Что можно сделать:\n"
-            "• создать новую тему\n"
-            "• добавить чаты для поиска\n"
-            "• добавить ключевые слова",
-            _themes_add_section_keyboard(),
+            f"Открыт актуальный экран «Темы».\n\n{await _build_themes_panel_text(user_id)}",
+            await _themes_panel_markup_for_user(user_id),
         )
     await callback.answer()
 
@@ -2387,13 +3130,8 @@ async def cb_themes_section_manage(callback: CallbackQuery) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "🗂 Раздел 2/3 — Выбор и удаление\n\n"
-            "Здесь можно:\n"
-            "• выбрать активную тему\n"
-            "• удалить ключевые слова\n"
-            "• удалить чаты\n"
-            "• удалить тему целиком",
-            _themes_manage_section_keyboard(),
+            f"Открыт актуальный экран «Темы».\n\n{await _build_themes_panel_text(user_id)}",
+            await _themes_panel_markup_for_user(user_id),
         )
     await callback.answer()
 
@@ -2405,11 +3143,8 @@ async def cb_themes_section_info(callback: CallbackQuery) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "ℹ️ Раздел 3/3 — Информация\n\n"
-            "Здесь можно посмотреть:\n"
-            "• список всех тем\n"
-            "• чаты, по которым идет поиск",
-            _themes_info_section_keyboard(),
+            f"Открыт актуальный экран «Темы».\n\n{await _build_themes_panel_text(user_id)}",
+            await _themes_panel_markup_for_user(user_id),
         )
     await callback.answer()
 
@@ -2424,7 +3159,7 @@ async def cb_themes_list(callback: CallbackQuery) -> None:
             callback,
             user_id,
             _render_themes_compact_list(themes),
-            _themes_info_section_keyboard(),
+            _themes_back_keyboard(),
         )
     await callback.answer()
 
@@ -2435,9 +3170,16 @@ async def cb_themes_current(callback: CallbackQuery) -> None:
         user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
         try:
             theme = await _resolve_theme_for_user(user_id, None)
-            await _edit_or_replace_watch_ui(callback, user_id, _format_theme(theme), _themes_manage_section_keyboard())
+            status_map = await _build_theme_status_map([theme], user_id)
+            status_icon, status_text = status_map.get(theme.id, ("•", "без статуса"))
+            await _edit_or_replace_watch_ui(
+                callback,
+                user_id,
+                _format_theme_card(theme, status_icon=status_icon, status_text=status_text),
+                _theme_detail_keyboard(theme.id),
+            )
         except Exception as e:
-            await _edit_or_replace_watch_ui(callback, user_id, str(e), _themes_manage_section_keyboard())
+            await _edit_or_replace_watch_ui(callback, user_id, str(e), _themes_back_keyboard())
     await callback.answer()
 
 
@@ -2446,7 +3188,7 @@ async def cb_themes_search_chats(callback: CallbackQuery) -> None:
     if callback.message and callback.from_user:
         user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
         text = await _build_search_chats_text(user_id)
-        await _edit_or_replace_watch_ui(callback, user_id, text, _themes_info_section_keyboard())
+        await _edit_or_replace_watch_ui(callback, user_id, text, _themes_back_keyboard())
     await callback.answer()
 
 
@@ -2460,7 +3202,7 @@ async def cb_themes_new(callback: CallbackQuery, state: FSMContext) -> None:
             user_id,
             "Введите имя новой темы следующим сообщением.\n"
             "Пример: news",
-            _themes_add_section_keyboard(),
+            _theme_wizard_keyboard(),
         )
     await callback.answer()
 
@@ -2469,14 +3211,17 @@ async def _add_all_account_chats_to_theme_via_callback(
     callback: CallbackQuery,
     user_id: int,
     theme: ThemeDTO,
+    *,
+    back_callback: Optional[str] = None,
 ) -> None:
     _, database, auth, search = _require_services()
+    next_markup = _theme_add_chat_keyboard(theme.id, back_callback=back_callback)
     if not await auth.is_authorized(user_id):
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
             "Сначала авторизуйте аккаунт через /auth.",
-            _theme_add_chat_keyboard(theme.id),
+            next_markup,
         )
         return
 
@@ -2484,7 +3229,7 @@ async def _add_all_account_chats_to_theme_via_callback(
         callback,
         user_id,
         f"Тема: {theme.name}\nСобираю все чаты аккаунта. Это может занять до минуты...",
-        _theme_add_chat_keyboard(theme.id),
+        next_markup,
     )
 
     try:
@@ -2494,7 +3239,7 @@ async def _add_all_account_chats_to_theme_via_callback(
             callback,
             user_id,
             f"Не удалось получить чаты аккаунта: {e}",
-            _theme_add_chat_keyboard(theme.id),
+            next_markup,
         )
         return
 
@@ -2503,7 +3248,7 @@ async def _add_all_account_chats_to_theme_via_callback(
             callback,
             user_id,
             "В аккаунте не найдено доступных чатов для добавления.",
-            _theme_add_chat_keyboard(theme.id),
+            next_markup,
         )
         return
 
@@ -2514,7 +3259,7 @@ async def _add_all_account_chats_to_theme_via_callback(
             callback,
             user_id,
             f"Не удалось добавить чаты в тему: {e}",
-            _theme_add_chat_keyboard(theme.id),
+            next_markup,
         )
         return
 
@@ -2531,7 +3276,7 @@ async def _add_all_account_chats_to_theme_via_callback(
             f"Добавлено новых в тему: {added}\n"
             f"Всего чатов в теме: {total_in_theme}"
         ),
-        _theme_add_chat_keyboard(theme.id),
+        next_markup,
     )
 
 
@@ -2548,7 +3293,7 @@ async def cb_themes_add_all_chats(callback: CallbackQuery) -> None:
             callback,
             user_id,
             "Сначала авторизуйте аккаунт через /auth.",
-            _themes_add_section_keyboard(),
+            await _themes_panel_markup_for_user(user_id),
         )
         await callback.answer()
         return
@@ -2559,7 +3304,7 @@ async def cb_themes_add_all_chats(callback: CallbackQuery) -> None:
             callback,
             user_id,
             "Тем пока нет. Сначала создайте тему.",
-            _themes_add_section_keyboard(),
+            await _themes_panel_markup_for_user(user_id),
         )
         await callback.answer()
         return
@@ -2567,19 +3312,32 @@ async def cb_themes_add_all_chats(callback: CallbackQuery) -> None:
     active_theme = await _get_active_theme_for_user(user_id)
     if active_theme is not None:
         await callback.answer("Запускаю импорт чатов...", show_alert=False)
-        await _add_all_account_chats_to_theme_via_callback(callback, user_id, active_theme)
+        await _add_all_account_chats_to_theme_via_callback(
+            callback,
+            user_id,
+            active_theme,
+            back_callback=f"themes:chats:{active_theme.id}",
+        )
         return
 
     if len(themes) == 1:
         await callback.answer("Запускаю импорт чатов...", show_alert=False)
-        await _add_all_account_chats_to_theme_via_callback(callback, user_id, themes[0])
+        await _add_all_account_chats_to_theme_via_callback(
+            callback,
+            user_id,
+            themes[0],
+            back_callback=f"themes:chats:{themes[0].id}",
+        )
         return
 
     await _edit_or_replace_watch_ui(
         callback,
         user_id,
-        "Выберите тему, в которую добавить все чаты аккаунта:",
-        _theme_picker_for_all_chats_keyboard(themes, back_callback="themes:section:add"),
+        (
+            "Старая форма выбора больше не используется.\n\n"
+            "Откройте нужную тему и нажмите «💬 Изменить чаты»."
+        ),
+        await _themes_panel_markup_for_user(user_id),
     )
     await callback.answer()
 
@@ -2609,13 +3367,18 @@ async def cb_themes_add_all_chats_theme(callback: CallbackQuery) -> None:
             callback,
             user_id,
             "Тема не найдена или уже удалена.",
-            _themes_add_section_keyboard(),
+            await _themes_panel_markup_for_user(user_id),
         )
         await callback.answer()
         return
 
     await callback.answer("Запускаю импорт чатов...", show_alert=False)
-    await _add_all_account_chats_to_theme_via_callback(callback, user_id, theme)
+    await _add_all_account_chats_to_theme_via_callback(
+        callback,
+        user_id,
+        theme,
+        back_callback=f"themes:chats:{theme.id}",
+    )
 
 
 @router.callback_query(F.data.startswith("themes:quick:"))
@@ -2643,7 +3406,7 @@ async def cb_themes_quick(callback: CallbackQuery, state: FSMContext) -> None:
             callback,
             user_id,
             "Сначала создайте тему: нажмите 'Создать тему'.",
-            _themes_add_section_keyboard(),
+            await _themes_panel_markup_for_user(user_id),
         )
         await callback.answer()
         return
@@ -2653,7 +3416,7 @@ async def cb_themes_quick(callback: CallbackQuery, state: FSMContext) -> None:
         active_theme_by_user[user_id] = active_theme.name
         await state.set_state(ThemeUiStates.waiting_bulk_payload)
         await state.update_data(theme_ui_action=action, theme_name=active_theme.name)
-        next_markup = _theme_add_chat_keyboard(active_theme.id) if action == "add_chat" else _themes_add_section_keyboard()
+        next_markup = _theme_add_chat_keyboard(active_theme.id, back_callback=f"themes:chats:{active_theme.id}") if action == "add_chat" else _theme_keywords_keyboard(active_theme.id)
         await _edit_or_replace_watch_ui(callback, user_id, _theme_action_prompt(action, active_theme.name), next_markup)
         await callback.answer()
         return
@@ -2663,17 +3426,19 @@ async def cb_themes_quick(callback: CallbackQuery, state: FSMContext) -> None:
         active_theme_by_user[user_id] = theme.name
         await state.set_state(ThemeUiStates.waiting_bulk_payload)
         await state.update_data(theme_ui_action=action, theme_name=theme.name)
-        next_markup = _theme_add_chat_keyboard(theme.id) if action == "add_chat" else _themes_add_section_keyboard()
+        next_markup = _theme_add_chat_keyboard(theme.id, back_callback=f"themes:chats:{theme.id}") if action == "add_chat" else _theme_keywords_keyboard(theme.id)
         await _edit_or_replace_watch_ui(callback, user_id, _theme_action_prompt(action, theme.name), next_markup)
         await callback.answer()
         return
 
-    action_title = "Выберите тему для добавления чатов" if action_code == "ac" else "Выберите тему для добавления ключевых слов"
     await _edit_or_replace_watch_ui(
         callback,
         user_id,
-        action_title,
-        _theme_picker_keyboard(themes, action_code, back_callback="themes:section:add"),
+        (
+            "Старая форма быстрого выбора темы больше не используется.\n\n"
+            "Выберите тему в списке и откройте нужное действие внутри неё."
+        ),
+        await _themes_panel_markup_for_user(user_id),
     )
     await callback.answer()
 
@@ -2699,24 +3464,18 @@ async def cb_themes_pick(callback: CallbackQuery) -> None:
     user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     themes = await database.list_themes(user_id)
     if not themes:
-        await _edit_or_replace_watch_ui(callback, user_id, "Тем пока нет. Сначала создайте тему.", _themes_manage_section_keyboard())
+        await _edit_or_replace_watch_ui(callback, user_id, "Тем пока нет. Сначала создайте тему.", await _themes_panel_markup_for_user(user_id))
         await callback.answer()
         return
-
-    action_title = {
-        "set_active": "Выберите тему для активации",
-        "add_kw": "Выберите тему для добавления ключевых слов",
-        "del_kw": "Выберите тему для удаления ключевых слов",
-        "add_chat": "Выберите тему для добавления чатов",
-        "del_chat": "Выберите тему для удаления чатов",
-        "delete_theme": "Выберите тему для удаления",
-    }[action]
 
     await _edit_or_replace_watch_ui(
         callback,
         user_id,
-        action_title,
-        _theme_picker_keyboard(themes, action_code, back_callback="themes:section:manage"),
+        (
+            "Старая форма выбора темы больше не используется.\n\n"
+            "Выберите тему в текущем списке и выполните действие внутри карточки темы."
+        ),
+        await _themes_panel_markup_for_user(user_id),
     )
     await callback.answer()
 
@@ -2748,38 +3507,44 @@ async def cb_themes_do(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     theme = await database.get_theme_by_id(user_id, theme_id)
     if theme is None:
-        fallback_markup = _themes_add_section_keyboard() if action in {"add_chat", "add_kw"} else _themes_manage_section_keyboard()
-        await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", fallback_markup)
+        await _edit_or_replace_watch_ui(callback, user_id, "Тема не найдена или уже удалена.", await _themes_panel_markup_for_user(user_id))
         await callback.answer()
         return
 
     if action == "set_active":
         active_theme_by_user[user_id] = theme.name
-        await _edit_or_replace_watch_ui(callback, user_id, f"Активная тема: {theme.name}", _themes_manage_section_keyboard())
+        status_map = await _build_theme_status_map([theme], user_id)
+        status_icon, status_text = status_map.get(theme.id, ("•", "без статуса"))
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            _format_theme_card(theme, status_icon=status_icon, status_text=status_text),
+            _theme_detail_keyboard(theme.id),
+        )
         await callback.answer()
         return
 
     if action == "delete_theme":
-        ok = await database.delete_theme(user_id, theme.name)
-        if ok:
-            current = active_theme_by_user.get(user_id)
-            if current and current.casefold() == theme.name.casefold():
-                active_theme_by_user.pop(user_id, None)
-            await _edit_or_replace_watch_ui(callback, user_id, f"Тема '{theme.name}' удалена.", _themes_manage_section_keyboard())
-        else:
-            await _edit_or_replace_watch_ui(callback, user_id, "Не удалось удалить тему.", _themes_manage_section_keyboard())
+        await _edit_or_replace_watch_ui(
+            callback,
+            user_id,
+            (
+                f"🗑️ Удаление темы '{theme.name}'\n\n"
+                "Будут удалены ключи, чаты и связанные подписки.\n"
+                "Подтвердите удаление."
+            ),
+            _theme_delete_confirm_keyboard(theme.id),
+        )
         await callback.answer()
         return
 
     active_theme_by_user[user_id] = theme.name
     await state.set_state(ThemeUiStates.waiting_bulk_payload)
     await state.update_data(theme_ui_action=action, theme_name=theme.name)
-    if action == "add_chat":
-        next_markup = _theme_add_chat_keyboard(theme.id)
-    elif action == "add_kw":
-        next_markup = _themes_add_section_keyboard()
+    if action in {"add_chat", "del_chat"}:
+        next_markup = _theme_chats_keyboard(theme.id)
     else:
-        next_markup = _themes_manage_section_keyboard()
+        next_markup = _theme_keywords_keyboard(theme.id)
     await _edit_or_replace_watch_ui(callback, user_id, _theme_action_prompt(action, theme.name), next_markup)
     await callback.answer()
 
@@ -2790,13 +3555,13 @@ async def st_theme_create_name(message: Message, state: FSMContext) -> None:
     _, database, _, _ = _require_services()
     name = (message.text or "").strip()
     if not name:
-        await _send_watch_ui_message(message, user_id, "Имя темы пустое. Введите корректное имя.", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, "Имя темы пустое. Введите корректное имя.", _theme_wizard_keyboard())
         return
 
     try:
         theme = await database.create_theme(user_id, name)
     except Exception as e:
-        await _send_watch_ui_message(message, user_id, f"Не удалось создать тему: {e}", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, f"Не удалось создать тему: {e}", _theme_wizard_keyboard())
         return
 
     active_theme_by_user[user_id] = theme.name
@@ -2806,7 +3571,7 @@ async def st_theme_create_name(message: Message, state: FSMContext) -> None:
         message,
         user_id,
         _theme_wizard_keywords_prompt(theme.name),
-        _themes_menu_keyboard(),
+        _theme_wizard_keyboard(),
     )
 
 
@@ -2821,12 +3586,12 @@ async def st_theme_wizard_keywords_skip(message: Message, state: FSMContext) -> 
             message,
             user_id,
             "Сессия создания темы устарела. Откройте раздел 'Темы' и начните заново.",
-            _themes_menu_keyboard(),
+            _theme_wizard_keyboard(),
         )
         return
     await state.set_state(ThemeUiStates.waiting_new_theme_chats)
     await state.update_data(theme_name=theme_name, wizard_kw_added=0)
-    await _send_watch_ui_message(message, user_id, _theme_wizard_chats_prompt(theme_name), _themes_menu_keyboard())
+    await _send_watch_ui_message(message, user_id, _theme_wizard_chats_prompt(theme_name), _theme_wizard_keyboard())
 
 
 @router.message(ThemeUiStates.waiting_new_theme_keywords, F.text, ~F.text.startswith("/"))
@@ -2835,7 +3600,7 @@ async def st_theme_wizard_keywords_input(message: Message, state: FSMContext) ->
     _, database, _, _ = _require_services()
     text = (message.text or "").strip()
     if not text:
-        await _send_watch_ui_message(message, user_id, "Пустой ввод. Отправьте ключевые слова списком.", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, "Пустой ввод. Отправьте ключевые слова списком.", _theme_wizard_keyboard())
         return
 
     data = await state.get_data()
@@ -2846,26 +3611,26 @@ async def st_theme_wizard_keywords_input(message: Message, state: FSMContext) ->
             message,
             user_id,
             "Сессия создания темы устарела. Откройте раздел 'Темы' и начните заново.",
-            _themes_menu_keyboard(),
+            _theme_wizard_keyboard(),
         )
         return
 
     theme_before = await database.get_theme(user_id, theme_name)
     if theme_before is None:
         await state.clear()
-        await _send_watch_ui_message(message, user_id, f"Тема '{theme_name}' не найдена.", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, f"Тема '{theme_name}' не найдена.", _theme_wizard_keyboard())
         return
 
     items = _split_bulk_items(text, allow_comma=True)
     if not items:
-        await _send_watch_ui_message(message, user_id, "Не удалось распознать ключевые слова. Проверьте формат.", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, "Не удалось распознать ключевые слова. Проверьте формат.", _theme_wizard_keyboard())
         return
 
     try:
         for item in items:
             await database.add_keyword(user_id, theme_before.name, item)
     except Exception as e:
-        await _send_watch_ui_message(message, user_id, f"Не удалось добавить ключевые слова: {e}", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, f"Не удалось добавить ключевые слова: {e}", _theme_wizard_keyboard())
         return
 
     theme_after = await database.get_theme(user_id, theme_before.name)
@@ -2879,18 +3644,20 @@ async def st_theme_wizard_keywords_input(message: Message, state: FSMContext) ->
         message,
         user_id,
         f"Ключевые слова сохранены: +{kw_added} (введено: {len(items)}).\n\n{_theme_wizard_chats_prompt(theme_before.name)}",
-        _themes_menu_keyboard(),
+        _theme_wizard_keyboard(),
     )
 
 
 @router.message(ThemeUiStates.waiting_new_theme_chats, F.text.startswith("/skip"))
 async def st_theme_wizard_chats_skip(message: Message, state: FSMContext) -> None:
     user_id = await _ensure_user(message)
+    _, database, _, _ = _require_services()
     data = await state.get_data()
     theme_name = data.get("theme_name")
     kw_added = int(data.get("wizard_kw_added") or 0)
     await state.clear()
     summary = await _build_themes_panel_text(user_id)
+    themes = await database.list_themes(user_id)
     await _send_watch_ui_message(
         message,
         user_id,
@@ -2900,7 +3667,7 @@ async def st_theme_wizard_chats_skip(message: Message, state: FSMContext) -> Non
             "Чатов добавлено: 0\n\n"
             f"{summary}"
         ),
-        _themes_menu_keyboard(),
+        await _themes_panel_markup_for_user(user_id),
     )
 
 
@@ -2910,7 +3677,7 @@ async def st_theme_wizard_chats_input(message: Message, state: FSMContext) -> No
     _, database, _, _ = _require_services()
     text = (message.text or "").strip()
     if not text:
-        await _send_watch_ui_message(message, user_id, "Пустой ввод. Отправьте чаты списком.", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, "Пустой ввод. Отправьте чаты списком.", _theme_wizard_keyboard())
         return
 
     data = await state.get_data()
@@ -2922,26 +3689,26 @@ async def st_theme_wizard_chats_input(message: Message, state: FSMContext) -> No
             message,
             user_id,
             "Сессия создания темы устарела. Откройте раздел 'Темы' и начните заново.",
-            _themes_menu_keyboard(),
+            _theme_wizard_keyboard(),
         )
         return
 
     theme_before = await database.get_theme(user_id, theme_name)
     if theme_before is None:
         await state.clear()
-        await _send_watch_ui_message(message, user_id, f"Тема '{theme_name}' не найдена.", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, f"Тема '{theme_name}' не найдена.", _theme_wizard_keyboard())
         return
 
     items = _split_bulk_items(text, allow_comma=False)
     if not items:
-        await _send_watch_ui_message(message, user_id, "Не удалось распознать чаты. Проверьте формат.", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, "Не удалось распознать чаты. Проверьте формат.", _theme_wizard_keyboard())
         return
 
     try:
         for item in items:
             await database.add_chat(user_id, theme_before.name, item)
     except Exception as e:
-        await _send_watch_ui_message(message, user_id, f"Не удалось добавить чаты: {e}", _themes_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, f"Не удалось добавить чаты: {e}", _theme_wizard_keyboard())
         return
 
     theme_after = await database.get_theme(user_id, theme_before.name)
@@ -2951,6 +3718,7 @@ async def st_theme_wizard_chats_input(message: Message, state: FSMContext) -> No
 
     await state.clear()
     summary = await _build_themes_panel_text(user_id)
+    themes = await database.list_themes(user_id)
     await _send_watch_ui_message(
         message,
         user_id,
@@ -2960,7 +3728,7 @@ async def st_theme_wizard_chats_input(message: Message, state: FSMContext) -> No
             f"Чатов добавлено: {chat_added} (введено: {len(items)})\n\n"
             f"{summary}"
         ),
-        _themes_menu_keyboard(),
+        await _themes_panel_markup_for_user(user_id),
     )
 
 
@@ -3027,8 +3795,22 @@ async def st_theme_bulk_payload(message: Message, state: FSMContext) -> None:
 
     active_theme_by_user[user_id] = theme.name
     await state.clear()
-    summary = await _build_themes_panel_text(user_id)
-    await _send_watch_ui_message(message, user_id, f"{result_text}\n\n{summary}", _themes_menu_keyboard())
+    updated_theme = await database.get_theme(user_id, theme.name)
+    if updated_theme is None:
+        await _send_watch_ui_message(message, user_id, result_text, await _themes_panel_markup_for_user(user_id))
+        return
+    if action in {"add_kw", "del_kw"}:
+        next_text = f"{result_text}\n\n{_format_theme_keywords_screen(updated_theme)}"
+        next_markup = _theme_keywords_keyboard(updated_theme.id)
+    else:
+        next_text = f"{result_text}\n\n{_format_theme_chats_screen(updated_theme)}"
+        next_markup = _theme_chats_keyboard(updated_theme.id)
+    await _send_watch_ui_message(
+        message,
+        user_id,
+        next_text,
+        next_markup,
+    )
 
 
 @router.message(Command("theme_new"))
@@ -3299,18 +4081,22 @@ async def cb_search(callback: CallbackQuery) -> None:
         user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
         is_auth = await auth.is_authorized(user_id)
         if not is_auth:
-            await _edit_or_replace_watch_ui(callback, user_id, "Сначала авторизуйте аккаунт через /auth.", _main_menu())
+            await _edit_or_replace_watch_ui(
+                callback,
+                user_id,
+                "Сначала подключите аккаунт в разделе «👤 Авторизация».",
+                _main_menu(),
+            )
             await callback.answer()
             return
 
+        user_settings = await _get_user_settings(user_id)
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Быстрый поиск кнопками:\n"
-            "1) Выберите тему или 'Все чаты'\n"
-            "2) Выберите формат результата\n"
-            "3) Выберите лимит\n"
-            "4) Выберите период поиска.",
+            "🔍 Поиск\n\n"
+            f"📄 Формат по умолчанию: {_format_output_format_value(user_settings.search_output_format)}\n\n"
+            "Выберите, где искать. Дальше бот последовательно запросит лимит, период и режим комментариев.",
             _search_menu_keyboard(),
         )
     await callback.answer()
@@ -3329,7 +4115,7 @@ async def cb_search_pick_theme(callback: CallbackQuery) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Темы отсутствуют. Создайте тему в разделе 'Темы'.",
+            "Тем пока нет.\n\nСначала создайте тему в разделе «☰ Темы».",
             _search_menu_keyboard(),
         )
         await callback.answer()
@@ -3342,13 +4128,16 @@ async def cb_search_pick_theme(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "searchui:all")
 async def cb_search_all(callback: CallbackQuery) -> None:
     if callback.message and callback.from_user:
+        app_settings, _, _, _ = _require_services()
         user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
+        user_settings = await _get_user_settings(user_id)
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Режим: По всем чатам из всех ваших тем.\n"
-            "Выберите формат результата:",
-            _search_format_keyboard(scope="all", theme_id=0),
+            "🌐 Поиск по всем чатам из всех тем\n\n"
+            f"📄 Формат: {_format_output_format_value(user_settings.search_output_format)}\n\n"
+            "Выберите лимит найденных сообщений:",
+            _search_limit_keyboard(user_settings.search_output_format, scope="all", theme_id=0, default_limit=app_settings.default_limit),
         )
     await callback.answer()
 
@@ -3378,11 +4167,15 @@ async def cb_search_theme_selected(callback: CallbackQuery) -> None:
         return
 
     active_theme_by_user[user_id] = theme.name
+    app_settings, _, _, _ = _require_services()
+    user_settings = await _get_user_settings(user_id)
     await _edit_or_replace_watch_ui(
         callback,
         user_id,
-        f"Режим: Тема '{theme.name}'.\nВыберите формат результата:",
-        _search_format_keyboard(scope="th", theme_id=theme.id),
+        f"🎯 Поиск по теме «{theme.name}»\n\n"
+        f"📄 Формат: {_format_output_format_value(user_settings.search_output_format)}\n\n"
+        "Выберите лимит найденных сообщений:",
+        _search_limit_keyboard(user_settings.search_output_format, scope="th", theme_id=theme.id, default_limit=app_settings.default_limit),
     )
     await callback.answer()
 
@@ -3451,7 +4244,7 @@ async def cb_search_limit(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     _, _, auth, _ = _require_services()
     if not await auth.is_authorized(user_id):
-        await _edit_or_replace_watch_ui(callback, user_id, "Сначала авторизуйте аккаунт через /auth.", _main_menu())
+        await _edit_or_replace_watch_ui(callback, user_id, "Сначала подключите аккаунт в разделе «👤 Авторизация».", _main_menu())
         await callback.answer()
         return
 
@@ -3460,7 +4253,7 @@ async def cb_search_limit(callback: CallbackQuery, state: FSMContext) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Поиск уже выполняется. Остановите его через /cancel.",
+            "Поиск уже выполняется. Дождитесь завершения текущего поиска.",
             _search_menu_keyboard(),
         )
         await callback.answer()
@@ -3479,7 +4272,7 @@ async def cb_search_limit(callback: CallbackQuery, state: FSMContext) -> None:
             "Введите лимит сообщений числом.\n"
             "Примеры: 50, 200\n"
             "Для режима без лимита отправьте 0.\n"
-            "Отмена: /cancel",
+            "Чтобы выйти, нажмите «🏠 Главное меню».",
             _search_menu_keyboard(),
         )
         await callback.answer()
@@ -3569,7 +4362,7 @@ async def cb_search_date(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     _, _, auth, _ = _require_services()
     if not await auth.is_authorized(user_id):
-        await _edit_or_replace_watch_ui(callback, user_id, "Сначала авторизуйте аккаунт через /auth.", _main_menu())
+        await _edit_or_replace_watch_ui(callback, user_id, "Сначала подключите аккаунт в разделе «👤 Авторизация».", _main_menu())
         await callback.answer()
         return
 
@@ -3578,7 +4371,7 @@ async def cb_search_date(callback: CallbackQuery, state: FSMContext) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Поиск уже выполняется. Остановите его через /cancel.",
+            "Поиск уже выполняется. Дождитесь завершения текущего поиска.",
             _search_menu_keyboard(),
         )
         await callback.answer()
@@ -3600,7 +4393,7 @@ async def cb_search_date(callback: CallbackQuery, state: FSMContext) -> None:
             "Пример: 2026-03-01 2026-03-12\n"
             "Можно ввести одну дату: 2026-03-12 (поиск только за день).\n"
             "Для поиска за всё время: all\n"
-            "Отмена: /cancel",
+            "Чтобы выйти, нажмите «🏠 Главное меню».",
             _search_menu_keyboard(),
         )
         await callback.answer()
@@ -3652,19 +4445,19 @@ async def st_search_custom_dates(message: Message, state: FSMContext) -> None:
     try:
         date_from, date_to = _parse_custom_dates_input(message.text or "")
     except Exception as e:
-        await _send_watch_ui_message(message, user_id, f"{e}\nПопробуйте снова или введите /cancel.", _search_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, f"{e}\nПопробуйте снова или нажмите «🏠 Главное меню».", _search_menu_keyboard())
         return
 
     _, _, auth, _ = _require_services()
     if not await auth.is_authorized(user_id):
         await state.clear()
-        await _send_watch_ui_message(message, user_id, "Сначала авторизуйте аккаунт через /auth.", _main_menu())
+        await _send_watch_ui_message(message, user_id, "Сначала подключите аккаунт в разделе «👤 Авторизация».", _main_menu())
         return
 
     current_task = active_search_tasks.get(user_id)
     if current_task and not current_task.done():
         await state.clear()
-        await _send_watch_ui_message(message, user_id, "Поиск уже выполняется. Остановите его через /cancel.", _search_menu_keyboard())
+        await _send_watch_ui_message(message, user_id, "Поиск уже выполняется. Дождитесь завершения текущего поиска.", _search_menu_keyboard())
         return
 
     await state.clear()
@@ -3712,7 +4505,7 @@ async def cb_search_comments_mode(callback: CallbackQuery) -> None:
     user_id = await _upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     _, _, auth, _ = _require_services()
     if not await auth.is_authorized(user_id):
-        await _edit_or_replace_watch_ui(callback, user_id, "Сначала авторизуйте аккаунт через /auth.", _main_menu())
+        await _edit_or_replace_watch_ui(callback, user_id, "Сначала подключите аккаунт в разделе «👤 Авторизация».", _main_menu())
         await callback.answer()
         return
 
@@ -3721,7 +4514,7 @@ async def cb_search_comments_mode(callback: CallbackQuery) -> None:
         await _edit_or_replace_watch_ui(
             callback,
             user_id,
-            "Поиск уже выполняется. Остановите его через /cancel.",
+            "Поиск уже выполняется. Дождитесь завершения текущего поиска.",
             _search_menu_keyboard(),
         )
         await callback.answer()
@@ -3761,8 +4554,13 @@ async def cmd_search(message: Message) -> None:
         await message.answer("Сначала авторизуйте аккаунт через /auth.")
         return
 
+    user_settings = await _get_user_settings(user_id)
     try:
-        parsed = _parse_search_command(message.text or "", default_limit=app_settings.default_limit)
+        parsed = _parse_search_command(
+            message.text or "",
+            default_limit=app_settings.default_limit,
+            default_output_format=user_settings.search_output_format,
+        )
     except Exception as e:
         await message.answer(str(e))
         return
@@ -3779,6 +4577,7 @@ async def cmd_search(message: Message) -> None:
         await message.answer("Поиск уже выполняется. Остановите его через /cancel.")
         return
 
+    _set_active_search_themes(user_id, [theme.name])
     await message.answer(
         _format_search_start_text(
             f"Тема '{theme.name}'",
@@ -3820,7 +4619,12 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     current_state = await state.get_state()
     if current_state and current_state.startswith(f"{ThemeUiStates.__name__}:"):
         await state.clear()
-        await _send_watch_ui_message(message, user_id, "Редактирование темы отменено.", _themes_menu_keyboard())
+        await _send_watch_ui_message(
+            message,
+            user_id,
+            "Редактирование темы отменено.",
+            await _themes_panel_markup_for_user(user_id),
+        )
         return
     if current_state and current_state.startswith(f"{WatchUiStates.__name__}:"):
         await state.clear()
@@ -3829,6 +4633,11 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     if current_state and current_state.startswith(f"{AuthStates.__name__}:"):
         await state.clear()
         await _send_watch_ui_message(message, user_id, "Ввод 2FA отменен.", await _main_menu_for_user(user_id))
+        return
+    if current_state and current_state.startswith(f"{SettingsUiStates.__name__}:"):
+        await state.clear()
+        user_settings = await _get_user_settings(user_id)
+        await _send_watch_ui_message(message, user_id, _settings_watch_text(user_settings), _settings_watch_keyboard())
         return
     if current_state and current_state.startswith(f"{SearchUiStates.__name__}:"):
         await state.clear()
@@ -3844,7 +4653,12 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
         current_state = await state.get_state()
         if current_state and current_state.startswith(f"{ThemeUiStates.__name__}:"):
             await state.clear()
-            await _edit_or_replace_watch_ui(callback, user_id, "Редактирование темы отменено.", _themes_menu_keyboard())
+            await _edit_or_replace_watch_ui(
+                callback,
+                user_id,
+                "Редактирование темы отменено.",
+                await _themes_panel_markup_for_user(user_id),
+            )
             await callback.answer()
             return
         if current_state and current_state.startswith(f"{WatchUiStates.__name__}:"):
@@ -3860,6 +4674,12 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
         if current_state and current_state.startswith(f"{AuthStates.__name__}:"):
             await state.clear()
             await _edit_or_replace_watch_ui(callback, user_id, "Ввод 2FA отменен.", await _main_menu_for_user(user_id))
+            await callback.answer()
+            return
+        if current_state and current_state.startswith(f"{SettingsUiStates.__name__}:"):
+            await state.clear()
+            user_settings = await _get_user_settings(user_id)
+            await _edit_or_replace_watch_ui(callback, user_id, _settings_watch_text(user_settings), _settings_watch_keyboard())
             await callback.answer()
             return
         if current_state and current_state.startswith(f"{SearchUiStates.__name__}:"):

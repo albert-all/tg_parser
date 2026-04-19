@@ -24,6 +24,7 @@ class PendingAuth:
     client: TelegramClient
     qr_login: object
     created_at: datetime
+    wait_task: asyncio.Task
 
 
 class AuthManager:
@@ -48,6 +49,12 @@ class AuthManager:
         ctx = self.pending.pop(user_id, None)
         if ctx:
             try:
+                if not ctx.wait_task.done():
+                    ctx.wait_task.cancel()
+                    try:
+                        await ctx.wait_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 await ctx.client.disconnect()
             except Exception:
                 pass
@@ -70,10 +77,12 @@ class AuthManager:
             return AuthStatus(status="authorized", message="Вы уже авторизованы.")
 
         qr_login = await client.qr_login()
+        wait_task = asyncio.create_task(qr_login.wait(timeout=self.qr_timeout_seconds))
         self.pending[user_id] = PendingAuth(
             client=client,
             qr_login=qr_login,
             created_at=datetime.now(timezone.utc),
+            wait_task=wait_task,
         )
         return AuthStatus(
             status="pending",
@@ -88,48 +97,50 @@ class AuthManager:
         ctx = self.pending.get(user_id)
         if not ctx:
             if await self.is_authorized(user_id):
-                return AuthStatus(status="authorized", message="Авторизация уже выполнена.")
-            return AuthStatus(status="missing", message="Нет активной авторизации. Запустите /auth.")
+                return AuthStatus(status="authorized", message="??????????? ??? ?????????.")
+            return AuthStatus(status="missing", message="??? ???????? ???????????. ????????? ??????????? ??????.")
 
-        # Иногда wait() не успевает отдать событие, хотя сессия уже авторизована.
         if await ctx.client.is_user_authorized():
             await self._close_pending(user_id)
-            return AuthStatus(status="authorized", message="Авторизация завершена успешно.")
+            return AuthStatus(status="authorized", message="??????????? ????????? ???????.")
 
-        try:
-            await ctx.qr_login.wait(timeout=2)
-        except asyncio.TimeoutError:
-            if await ctx.client.is_user_authorized():
+        if not ctx.wait_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(ctx.wait_task), timeout=2)
+            except asyncio.TimeoutError:
+                pass
+            except SessionPasswordNeededError:
+                return AuthStatus(status="need_2fa", message="Требуется пароль 2FA. Отправьте его следующим сообщением.")
+            except Exception as e:
                 await self._close_pending(user_id)
-                return AuthStatus(status="authorized", message="Авторизация завершена успешно.")
+                return AuthStatus(status="error", message=f"Ошибка авторизации: {e}")
 
-            # Доп. проверка через новый клиент и сессию на диске:
-            # иногда текущий pending-клиент не обновляет auth-state мгновенно.
-            if await self.is_authorized(user_id):
+        if ctx.wait_task.done():
+            try:
+                ctx.wait_task.result()
+            except SessionPasswordNeededError:
+                return AuthStatus(status="need_2fa", message="Требуется пароль 2FA. Отправьте его следующим сообщением.")
+            except asyncio.TimeoutError:
                 await self._close_pending(user_id)
-                return AuthStatus(status="authorized", message="Авторизация завершена успешно.")
+                return AuthStatus(status="expired", message="QR-??? ?????. ???????? ??? ? ?????????? ?????.")
+            except Exception as e:
+                await self._close_pending(user_id)
+                return AuthStatus(status="error", message=f"?????? ???????????: {e}")
 
-            ttl = self.qr_timeout_seconds - int((datetime.now(timezone.utc) - ctx.created_at).total_seconds())
-            if ttl <= 0:
-                return AuthStatus(status="expired", message="QR истек. Обновите через /auth_refresh.")
-            return AuthStatus(
-                status="pending",
-                message=(
-                    "Пока не подтверждено. Сканируйте QR и повторите /auth_check.\n"
-                    "Если у аккаунта включена 2FA и QR уже подтвержден, нажмите /auth_2fa и введите пароль."
-                ),
-            )
-        except SessionPasswordNeededError:
-            return AuthStatus(status="need_2fa", message="Требуется пароль 2FA. Отправьте его следующим сообщением.")
-        except Exception as e:
+            is_auth = await ctx.client.is_user_authorized()
             await self._close_pending(user_id)
-            return AuthStatus(status="error", message=f"Ошибка авторизации: {e}")
+            if is_auth:
+                return AuthStatus(status="authorized", message="??????????? ????????? ???????.")
+            return AuthStatus(status="error", message="?? ??????? ????????? ???????????.")
 
-        is_auth = await ctx.client.is_user_authorized()
-        await self._close_pending(user_id)
-        if is_auth:
-            return AuthStatus(status="authorized", message="Авторизация завершена успешно.")
-        return AuthStatus(status="error", message="Не удалось завершить авторизацию.")
+        ttl = self.qr_timeout_seconds - int((datetime.now(timezone.utc) - ctx.created_at).total_seconds())
+        if ttl <= 0:
+            await self._close_pending(user_id)
+            return AuthStatus(status="expired", message="QR-??? ?????. ???????? ??? ? ?????????? ?????.")
+        return AuthStatus(
+            status="pending",
+            message="QR-??? ??? ?? ???????????. ???????????? ??? ? Telegram ? ??????? ?????? ????????.",
+        )
 
     async def submit_2fa(self, user_id: int, password: str) -> AuthStatus:
         ctx = self.pending.get(user_id)
